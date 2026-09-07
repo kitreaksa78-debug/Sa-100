@@ -14,23 +14,23 @@ export const Header: React.FC<HeaderProps> = ({
   const t = UI_TEXT[uiLang];
 
   return (
-    <header className="border-b border-stone-200 bg-white/90 backdrop-blur-sm sticky top-0 z-30">
+    <header className="border-b border-stone-200/80 bg-white/95 backdrop-blur-md sticky top-0 z-30 shadow-sm shadow-stone-200/50">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3.5 flex flex-wrap items-center justify-between gap-4">
         {/* Brand / Logo */}
         <div className="flex items-center gap-3 min-w-0">
-          <div className="w-10 h-10 rounded-xl bg-orange-600 text-white flex items-center justify-center shadow-sm font-bold text-xl tracking-tight shrink-0">
+          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-orange-500 via-amber-500 to-orange-600 text-white flex items-center justify-center shadow-md shadow-orange-500/25 font-bold text-xl tracking-tight shrink-0 ring-1 ring-white/20">
             <Sparkles className="w-5 h-5" />
           </div>
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <h1 className="text-sm sm:text-xl font-bold text-stone-900 tracking-tight truncate">
+              <h1 className="text-sm sm:text-xl font-bold bg-gradient-to-r from-stone-900 via-stone-800 to-stone-700 bg-clip-text text-transparent tracking-tight truncate">
                 {t.appName}
               </h1>
-              <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-orange-100 text-orange-800 shrink-0">
+              <span className="hidden sm:inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-gradient-to-r from-orange-500 to-amber-500 text-white shadow-sm shadow-orange-500/20 shrink-0">
                 Groq AI
               </span>
             </div>
-            <p className="text-xs text-stone-700 hidden md:block truncate">
+            <p className="text-xs text-stone-500 hidden md:block truncate">
               {t.tagline}
             </p>
           </div>

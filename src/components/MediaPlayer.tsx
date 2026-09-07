@@ -744,20 +744,20 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
       handle = buildExportPath(el, bgVolume, voiceVolume);
       const { ctx, mixDest, bgGain, voiceGain, restore } = handle;
 
-      // Pick the best supported container (MP4 where available, else WebM)
-      const candidates = isVideo
+      // Pick the best supported container — MP4 only, no WebM fallback
+      const mp4Candidates = isVideo
         ? [
             'video/mp4;codecs="avc1.42E01E,mp4a.40.2"',
             'video/mp4',
-            'video/webm;codecs=vp9,opus',
-            'video/webm;codecs=vp8,opus',
-            'video/webm',
           ]
-        : ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'];
+        : ['audio/mp4'];
       const mimeType =
-        candidates.find((m) => {
+        mp4Candidates.find((m) => {
           try { return MediaRecorder.isTypeSupported(m); } catch { return false; }
-        }) || (isVideo ? 'video/webm' : 'audio/webm');
+        });
+      if (!mimeType) {
+        throw new Error('Your browser does not support MP4 recording. Please use Chrome or Edge for MP4 export.');
+      }
 
       // Video track: when CC is ON, burn subtitles onto a canvas stream so the
       // downloaded video INCLUDES them. When CC is OFF, capture the raw video
@@ -905,28 +905,39 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
 
       const outBlob = new Blob(chunks, { type: mimeType.split(';')[0] });
 
-      // If this is a video, send WebM to server for FFmpeg MP4 conversion
-      if (isVideo && outBlob.size > 1000) {
+      // MP4 only — no WebM fallback. If the browser recorded MP4 natively, use it directly.
+      // If not MP4 (should not happen with the guard above), try server-side conversion.
+      const isAlreadyMp4 = mimeType.includes('mp4');
+
+      if (isVideo && outBlob.size > 1000 && !isAlreadyMp4) {
+        // Non-MP4 recording — attempt server-side FFmpeg conversion to MP4
         try {
           const formData = new FormData();
           formData.append('video', outBlob, 'recording.webm');
           onProgress?.(0.95);
           const resp = await fetch('/api/render-mp4', { method: 'POST', body: formData });
           if (resp.ok) {
-            const mp4Blob = await resp.blob();
-            if (mp4Blob.size > 1000) {
-              console.log(`[Export] MP4 conversion: ${(mp4Blob.size / 1024 / 1024).toFixed(1)}MB`);
-              return { blob: mp4Blob, ext: 'mp4' };
+            const ct = resp.headers.get('content-type') || '';
+            if (ct.includes('video/mp4') || ct.includes('application/octet-stream')) {
+              const mp4Blob = await resp.blob();
+              if (mp4Blob.size > 1000) {
+                console.log(`[Export] Server MP4 conversion: ${(mp4Blob.size / 1024 / 1024).toFixed(1)}MB`);
+                return { blob: mp4Blob, ext: 'mp4' };
+              }
             }
           }
-          const errData = await resp.json().catch(() => ({}));
-          console.warn('[Export] MP4 conversion failed, using WebM:', errData.error);
+          await resp.text().catch(() => '');
+          throw new Error('Server-side MP4 conversion is unavailable. MP4 export requires Chrome or Edge browser.');
         } catch (err) {
-          console.warn('[Export] MP4 conversion error, using WebM:', err);
+          throw new Error('MP4 conversion failed. Please use Chrome or Edge for direct MP4 recording.');
         }
       }
 
-      const ext = mimeType.includes('mp4') ? (isVideo ? 'mp4' : 'm4a') : isVideo ? 'webm' : 'webm';
+      if (isVideo && outBlob.size > 1000) {
+        console.log(`[Export] Native MP4 recording: ${(outBlob.size / 1024 / 1024).toFixed(1)}MB`);
+      }
+
+      const ext = isVideo ? 'mp4' : 'm4a';
       return { blob: outBlob, ext };
     } catch (err) {
       console.error('Export failed:', err);
