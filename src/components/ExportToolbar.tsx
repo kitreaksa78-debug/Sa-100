@@ -8,6 +8,8 @@ import {
   RefreshCw,
   Sparkles,
   Layers,
+  Mic,
+  Loader2,
 } from 'lucide-react';
 import { SubtitleSegment, TranscriptionResult } from '../types';
 import { UILang, UI_TEXT } from '../data/translations';
@@ -19,6 +21,13 @@ interface ExportToolbarProps {
   onRetranslate: (targetLang: string, targetLangName: string) => void;
   isRetranslating: boolean;
   uiLang: UILang;
+  onGenerateDubbing: () => void;
+  isGeneratingDubbing: boolean;
+  dubbingProgress: number;
+  dubbingTotal: number;
+  onExportDubbed: () => void;
+  isExportingDubbed: boolean;
+  exportProgress: number; // 0..1
 }
 
 export const ExportToolbar: React.FC<ExportToolbarProps> = ({
@@ -26,6 +35,13 @@ export const ExportToolbar: React.FC<ExportToolbarProps> = ({
   onRetranslate,
   isRetranslating,
   uiLang,
+  onGenerateDubbing,
+  isGeneratingDubbing,
+  dubbingProgress,
+  dubbingTotal,
+  onExportDubbed,
+  isExportingDubbed,
+  exportProgress,
 }) => {
   const t = UI_TEXT[uiLang];
   const [copied, setCopied] = useState(false);
@@ -78,11 +94,13 @@ export const ExportToolbar: React.FC<ExportToolbarProps> = ({
     }
   };
 
+  const hasDubbedAudio = result.segments.some((s) => s.dubbedAudioBase64);
+
   return (
     <div className="bg-white rounded-2xl border border-stone-200 shadow-xs p-4 sm:p-5 space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+      <div className="flex flex-col sm:flex-row sm:flex-wrap items-stretch sm:items-center justify-between gap-2 sm:gap-3">
         {/* Statistics & Badges */}
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-stone-100 text-stone-700 text-xs font-semibold">
             {t.detectedLangBadge}:{' '}
             <strong className="text-stone-900 uppercase">{result.detectedLanguage}</strong>
@@ -107,7 +125,91 @@ export const ExportToolbar: React.FC<ExportToolbarProps> = ({
         </div>
 
         {/* Audio TTS and Copy Buttons */}
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
+          {/* Generate AI Voice Dubbing Button */}
+          <button
+            id="generate-ai-dubbing-btn"
+            type="button"
+            onClick={onGenerateDubbing}
+            disabled={isGeneratingDubbing}
+            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold border transition-all ${
+              isGeneratingDubbing
+                ? 'bg-orange-50 text-orange-700 border-orange-200 cursor-wait'
+                : hasDubbedAudio
+                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                : 'bg-gradient-to-r from-orange-600 to-amber-600 text-white border-orange-500 hover:from-orange-700 hover:to-amber-700 shadow-sm'
+            }`}
+          >
+            {isGeneratingDubbing ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : hasDubbedAudio ? (
+              <Check className="w-3.5 h-3.5" />
+            ) : (
+              <Mic className="w-3.5 h-3.5" />
+            )}
+            <span>
+              {isGeneratingDubbing
+                ? `${t.generatingAiVoice} ${dubbingProgress}/${dubbingTotal}`
+                : hasDubbedAudio
+                ? t.aiVoiceReady
+                : t.generateAiVoice}
+            </span>
+          </button>
+
+          {/* Progress bar when generating */}
+          {isGeneratingDubbing && dubbingTotal > 0 && (
+            <div className="hidden sm:flex items-center gap-2">
+              <div className="w-16 h-1.5 bg-orange-100 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-orange-500 rounded-full transition-all duration-300"
+                  style={{ width: `${(dubbingProgress / dubbingTotal) * 100}%` }}
+                />
+              </div>
+              <span className="text-[10px] font-mono text-orange-600">
+                {Math.round((dubbingProgress / dubbingTotal) * 100)}%
+              </span>
+            </div>
+          )}
+
+          {/* Export Dubbed Video Button — records video + AI voice mix in real-time */}
+          <button
+            id="export-dubbed-video-btn"
+            type="button"
+            onClick={onExportDubbed}
+            disabled={isExportingDubbed || !hasDubbedAudio}
+            title={!hasDubbedAudio ? t.exportDubbedFailed : t.exportDubbedHint}
+            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold border transition-all ${
+              isExportingDubbed
+                ? 'bg-indigo-50 text-indigo-700 border-indigo-200 cursor-wait'
+                : !hasDubbedAudio
+                ? 'bg-stone-50 text-stone-400 border-stone-200 cursor-not-allowed'
+                : 'bg-gradient-to-r from-indigo-600 to-violet-600 text-white border-indigo-500 hover:from-indigo-700 hover:to-violet-700 shadow-sm'
+            }`}
+          >
+            {isExportingDubbed ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Layers className="w-3.5 h-3.5" />
+            )}
+            <span>
+              {isExportingDubbed
+                ? `${t.exportingDubbed} ${Math.round(exportProgress * 100)}%`
+                : t.exportDubbedVideo}
+            </span>
+          </button>
+
+          {/* Export progress bar */}
+          {isExportingDubbed && (
+            <div className="hidden sm:flex items-center gap-2">
+              <div className="w-16 h-1.5 bg-indigo-100 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-indigo-500 rounded-full transition-all duration-300"
+                  style={{ width: `${Math.round(exportProgress * 100)}%` }}
+                />
+              </div>
+            </div>
+          )}
+
           <button
             id="export-toggle-audio-tts"
             type="button"
@@ -135,7 +237,7 @@ export const ExportToolbar: React.FC<ExportToolbarProps> = ({
       </div>
 
       {/* Export Action Buttons Row */}
-      <div className="pt-3 border-t border-stone-100 flex flex-wrap items-center justify-between gap-3">
+      <div className="pt-3 border-t border-stone-100 flex flex-col sm:flex-row sm:flex-wrap items-stretch sm:items-center justify-between gap-2 sm:gap-3">
         <div className="flex flex-wrap items-center gap-2">
           {/* Download Translated SRT */}
           <button

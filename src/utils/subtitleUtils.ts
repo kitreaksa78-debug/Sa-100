@@ -95,6 +95,9 @@ export async function speakText(
   }
 
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+
     const res = await fetch('/api/tts', {
       method: 'POST',
       headers: {
@@ -104,33 +107,44 @@ export async function speakText(
         text: text.trim(),
         language: langCode,
       }),
+      signal: controller.signal,
     });
 
-    if (res.ok) {
+    clearTimeout(timeout);
+
+    if (res.ok && res.headers.get('content-type')?.includes('audio')) {
       const blob = await res.blob();
-      const audioUrl = URL.createObjectURL(blob);
-      const audio = new Audio(audioUrl);
-      currentAiAudio = audio;
+      if (blob.size > 100) {
+        const audioUrl = URL.createObjectURL(blob);
+        const audio = new Audio(audioUrl);
+        currentAiAudio = audio;
 
-      audio.onended = () => {
-        URL.revokeObjectURL(audioUrl);
-        if (currentAiAudio === audio) {
+        audio.onended = () => {
+          URL.revokeObjectURL(audioUrl);
+          if (currentAiAudio === audio) {
+            currentAiAudio = null;
+          }
+          onEnded?.();
+        };
+
+        audio.onerror = () => {
+          URL.revokeObjectURL(audioUrl);
+          if (currentAiAudio === audio) {
+            currentAiAudio = null;
+          }
+          fallbackBrowserSpeak(text, langCode, onEnded);
+        };
+
+        try {
+          await audio.play();
+          return audio;
+        } catch {
+          URL.revokeObjectURL(audioUrl);
           currentAiAudio = null;
         }
-        onEnded?.();
-      };
-
-      audio.onerror = () => {
-        URL.revokeObjectURL(audioUrl);
-        if (currentAiAudio === audio) {
-          currentAiAudio = null;
-        }
-        fallbackBrowserSpeak(text, langCode, onEnded);
-      };
-
-      await audio.play();
-      return audio;
+      }
     }
+    // 204 or non-audio response = no AI voice available, fall through
   } catch (err) {
     console.warn('Backend AI TTS failed, trying browser voice:', err);
   }
@@ -150,14 +164,21 @@ function fallbackBrowserSpeak(text: string, langCode: string, onEnded?: () => vo
   const utterance = new SpeechSynthesisUtterance(text);
   const voices = window.speechSynthesis.getVoices();
   const prefix = (langCode || 'km').toLowerCase().substring(0, 2);
-  const voice = voices.find((v) => v.lang.toLowerCase().startsWith(prefix));
-  if (voice) {
-    utterance.voice = voice;
-  }
-  utterance.rate = 0.95;
+
+  // Try exact match first, then prefix match, then any available voice
+  const exactVoice = voices.find((v) => v.lang.toLowerCase() === langCode.toLowerCase());
+  const prefixVoice = voices.find((v) => v.lang.toLowerCase().startsWith(prefix));
+  utterance.voice = exactVoice || prefixVoice || voices[0];
+
+  utterance.rate = 0.9;
+  utterance.pitch = 1.0;
   utterance.onend = () => onEnded?.();
   utterance.onerror = () => onEnded?.();
+
+  // Chrome bug: resume before speaking
+  window.speechSynthesis.cancel();
   window.speechSynthesis.speak(utterance);
+  window.speechSynthesis.resume();
 }
 
 export function stopSpeaking() {

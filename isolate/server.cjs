@@ -1,55 +1,66 @@
-import "dotenv/config";
-import express from "express";
-import multer from "multer";
-import { createServer as createViteServer } from "vite";
-import https from "https";
-import { execFile } from "child_process";
-import { promisify } from "util";
-import { writeFile, readFile, unlink, mkdtemp } from "fs/promises";
-import { tmpdir } from "os";
-import { join } from "path";
+var __create = Object.create;
+var __defProp = Object.defineProperty;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getProtoOf = Object.getPrototypeOf;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (let key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key) && key !== except)
+        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+  }
+  return to;
+};
+var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
+  // If the importer is in node compatibility mode or this is not an ESM
+  // file that has been converted to a CommonJS file using a Babel-
+  // compatible transform (i.e. "__esModule" has not been set), then set
+  // "default" to the CommonJS "module.exports" for node compatibility.
+  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
+  mod
+));
 
-const execFileAsync = promisify(execFile);
-
-const PORT = Number(process.env.PORT) || 5173;
-const app = express();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 26_214_400 } });
-const uploadLarge = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } }); // 100MB for video render
-
-function getAllGroqKeys(req: express.Request): string[] {
-  const keys: string[] = [];
-  // User-provided key from the client takes priority
-  const headerKey = req.headers["x-groq-api-key"] as string | undefined;
+// server.ts
+var import_config = require("dotenv/config");
+var import_express = __toESM(require("express"), 1);
+var import_multer = __toESM(require("multer"), 1);
+var import_vite = require("vite");
+var import_https = __toESM(require("https"), 1);
+var import_child_process = require("child_process");
+var import_util = require("util");
+var import_promises = require("fs/promises");
+var import_os = require("os");
+var import_path = require("path");
+var execFileAsync = (0, import_util.promisify)(import_child_process.execFile);
+var PORT = Number(process.env.PORT) || 5173;
+var app = (0, import_express.default)();
+var upload = (0, import_multer.default)({ storage: import_multer.default.memoryStorage(), limits: { fileSize: 26214400 } });
+var uploadLarge = (0, import_multer.default)({ storage: import_multer.default.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
+function getAllGroqKeys(req) {
+  const keys = [];
+  const headerKey = req.headers["x-groq-api-key"];
   if (headerKey?.trim()) keys.push(headerKey.trim());
-  // Then env keys in order: 1, 2, 3
   for (const envKey of ["GROQ_API_KEY", "GROQ_API_KEY2", "GROQ_API_KEY3"]) {
     const val = process.env[envKey]?.trim();
     if (val && !keys.includes(val)) keys.push(val);
   }
   return keys;
 }
-
-async function fetchWithKeyFallback(
-  url: string,
-  keys: string[],
-  options: Omit<RequestInit, "headers"> & { headers?: Record<string, string> }
-): Promise<{ res: Response; key: string }> {
-  let lastErr: any;
+async function fetchWithKeyFallback(url, keys, options) {
+  let lastErr;
   for (const key of keys) {
     try {
       const res = await fetch(url, {
         ...options,
-        headers: { ...options.headers, Authorization: `Bearer ${key}` },
+        headers: { ...options.headers, Authorization: `Bearer ${key}` }
       });
       if (res.ok) return { res, key };
-      // Always consume the body to avoid connection leaks
       const errBody = await res.text().catch(() => "");
-      // On rate-limit (429), server errors (5xx), or model errors (404/403), try next key
       if (res.status === 429 || res.status >= 500 || res.status === 404 || res.status === 403) {
         lastErr = new Error(`HTTP ${res.status} with key ...${key.slice(-6)}: ${errBody.slice(0, 200)}`);
         continue;
       }
-      // Other client errors (401, 400 etc) - return as-is
       return { res, key };
     } catch (err) {
       lastErr = err;
@@ -57,98 +68,73 @@ async function fetchWithKeyFallback(
   }
   throw lastErr || new Error("All API keys failed");
 }
-
-// Google Translate TTS (free, supports 50+ languages including Khmer)
-function fetchGoogleTTSChunk(text: string, lang: string): Promise<Buffer> {
+function fetchGoogleTTSChunk(text, lang) {
   return new Promise((resolve, reject) => {
     const encoded = encodeURIComponent(text.trim());
-    // Natural speed for human-like voice (no ttsspeed param = normal)
     const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encoded}&tl=${lang}&client=tw-ob`;
-    const req = https.get(url, {
-      headers: { "User-Agent": "Mozilla/5.0" },
+    const req = import_https.default.get(url, {
+      headers: { "User-Agent": "Mozilla/5.0" }
     }, (res) => {
       if (res.statusCode !== 200) {
         reject(new Error(`Google TTS returned ${res.statusCode}`));
         return;
       }
-      const chunks: Buffer[] = [];
-      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
       res.on("end", () => resolve(Buffer.concat(chunks)));
     });
     req.on("error", reject);
-    req.setTimeout(15000, () => {
+    req.setTimeout(15e3, () => {
       req.destroy();
       reject(new Error("Google TTS timeout"));
     });
   });
 }
-
-// Split text into natural sentences for better pacing
-function splitSentences(text: string): string[] {
-  // Split on sentence-ending punctuation (Khmer ។ and universal !?.)
+function splitSentences(text) {
   return text.split(/[។!?.]+/).map((s) => s.trim()).filter((s) => s.length > 0);
 }
-
-// Generate natural-sounding audio by splitting into sentences with pauses
-// Uses natural speech speed (client-side playbackRate handles timing sync)
-async function googleTTS(text: string, lang: string): Promise<Buffer> {
+async function googleTTS(text, lang) {
   const sentences = splitSentences(text.trim());
   if (sentences.length === 0) {
-    // Single chunk fallback
     return fetchGoogleTTSChunk(text.trim(), lang);
   }
-
-  const buffers: Buffer[] = [];
-  // Generate 200ms silence as MP3 frames for natural pause between sentences
+  const buffers = [];
   const silenceMs = 200;
-  const silence = Buffer.alloc(Math.floor(24000 * silenceMs / 1000 / 8), 0);
-
+  const silence = Buffer.alloc(Math.floor(24e3 * silenceMs / 1e3 / 8), 0);
   for (const sentence of sentences) {
     try {
       const chunk = await fetchGoogleTTSChunk(sentence, lang);
       buffers.push(chunk);
-      // Only add pause between sentences (not after the last one)
       if (sentence !== sentences[sentences.length - 1]) {
         buffers.push(silence);
       }
     } catch {
-      // Skip failed chunks, continue with others
     }
   }
-
   if (buffers.length === 0) {
     throw new Error("All TTS chunks failed");
   }
-
   return Buffer.concat(buffers);
 }
-
-// --- API Routes ---
-
 app.get("/api/status", (_req, res) => {
   res.json({
     groqConfigured: Boolean(process.env.GROQ_API_KEY?.trim()),
-    geminiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
+    geminiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim())
   });
 });
-
 app.post("/api/transcribe-and-translate", upload.single("file"), async (req, res) => {
   const apiKeys = getAllGroqKeys(req);
   if (apiKeys.length === 0) {
     res.status(400).json({ error: "Groq API key is required. Please provide one in Settings or via environment.", code: "MISSING_API_KEY" });
     return;
   }
-
   const file = req.file;
   const { whisperModel = "whisper-large-v3", translationModel = "openai/gpt-oss-120b", sourceLanguage = "auto", targetLanguage = "km", targetLanguageName = "Khmer" } = req.body;
-
   if (!file) {
     res.status(400).json({ error: "No file uploaded" });
     return;
   }
-
   try {
-    // Step 1: Transcribe with Groq Whisper
     const formData = new FormData();
     formData.append("file", new Blob([file.buffer], { type: file.mimetype }), file.originalname);
     formData.append("model", whisperModel);
@@ -156,42 +142,33 @@ app.post("/api/transcribe-and-translate", upload.single("file"), async (req, res
     if (sourceLanguage && sourceLanguage !== "auto") {
       formData.append("language", sourceLanguage);
     }
-
     const { res: whisperRes } = await fetchWithKeyFallback(
       "https://api.groq.com/openai/v1/audio/transcriptions",
       apiKeys,
       { method: "POST", body: formData }
     );
-
     if (!whisperRes.ok) {
       const errText = await whisperRes.text();
       throw new Error(`Whisper API error (${whisperRes.status}): ${errText}`);
     }
-
-    const whisperData = await whisperRes.json() as any;
-    const segments = (whisperData.segments || []).map((seg: any, i: number) => ({
+    const whisperData = await whisperRes.json();
+    const segments = (whisperData.segments || []).map((seg, i) => ({
       id: i + 1,
       start: seg.start,
       end: seg.end,
       originalText: seg.text?.trim() || "",
-      translatedText: "",
+      translatedText: ""
     }));
-
     const detectedLanguage = whisperData.language || sourceLanguage;
-    const fullOriginalText = segments.map((s: any) => s.originalText).join(" ");
+    const fullOriginalText = segments.map((s) => s.originalText).join(" ");
     const duration = whisperData.duration || 0;
     const processingTimeMs = 0;
-
-    // Step 2: Translate segments with Llama via Groq Chat API
-    const langPair = `${detectedLanguage} → ${targetLanguage}`;
+    const langPair = `${detectedLanguage} \u2192 ${targetLanguage}`;
     const prompt = `You are a professional subtitle translator. Translate each numbered segment below from ${langPair}. Keep the numbering and return ONLY the translated text lines, one per segment, preserving blank lines between segments.
 
-${segments.map((s: any, i: number) => `${i + 1}. ${s.originalText}`).join("\n")}`;
-
-    // Try the selected model first, then fallback models if it fails
+${segments.map((s, i) => `${i + 1}. ${s.originalText}`).join("\n")}`;
     const modelsToTry = [translationModel, "openai/gpt-oss-120b", "openai/gpt-oss-20b"].filter((m, i, arr) => arr.indexOf(m) === i);
-    let chatData: any = null;
-
+    let chatData = null;
     for (const model of modelsToTry) {
       try {
         const result = await fetchWithKeyFallback(
@@ -204,8 +181,8 @@ ${segments.map((s: any, i: number) => `${i + 1}. ${s.originalText}`).join("\n")}
               model,
               messages: [{ role: "user", content: prompt }],
               temperature: 0.1,
-              max_tokens: 4096,
-            }),
+              max_tokens: 4096
+            })
           }
         );
         if (result.res.ok) {
@@ -215,32 +192,23 @@ ${segments.map((s: any, i: number) => `${i + 1}. ${s.originalText}`).join("\n")}
           await result.res.text().catch(() => "");
           console.warn(`[Transcribe+Translate] Model ${model} returned ${result.res.status}`);
         }
-      } catch (err: any) {
+      } catch (err) {
         console.warn(`[Transcribe+Translate] Model ${model} failed:`, err?.message);
         continue;
       }
     }
-
     if (!chatData) {
       throw new Error("Translation failed: all models are unavailable. Please check your API key.");
     }
-    const translatedLines = (chatData.choices?.[0]?.message?.content || "")
-      .split("\n")
-      .map((l: string) => l.replace(/^\d+[\.\)]\s*/, "").trim())
-      .filter((l: string) => l.length > 0);
-
-    segments.forEach((seg: any, i: number) => {
+    const translatedLines = (chatData.choices?.[0]?.message?.content || "").split("\n").map((l) => l.replace(/^\d+[\.\)]\s*/, "").trim()).filter((l) => l.length > 0);
+    segments.forEach((seg, i) => {
       seg.translatedText = translatedLines[i] || seg.originalText;
     });
-
-    const fullTranslatedText = segments.map((s: any) => s.translatedText).join(" ");
-
-    // Build SRT and VTT strings
+    const fullTranslatedText = segments.map((s) => s.translatedText).join(" ");
     const srtOriginal = buildSrt(segments, false);
     const srtTranslated = buildSrt(segments, true);
     const vttOriginal = buildVtt(segments, false);
     const vttTranslated = buildVtt(segments, true);
-
     res.json({
       detectedLanguage,
       targetLanguage,
@@ -253,38 +221,31 @@ ${segments.map((s: any, i: number) => `${i + 1}. ${s.originalText}`).join("\n")}
       srtOriginal,
       srtTranslated,
       vttOriginal,
-      vttTranslated,
+      vttTranslated
     });
-  } catch (err: any) {
+  } catch (err) {
     console.error("Transcription error:", err);
     res.status(500).json({ error: err.message || "Transcription failed" });
   }
 });
-
-app.post("/api/translate-segments", express.json(), async (req, res) => {
+app.post("/api/translate-segments", import_express.default.json(), async (req, res) => {
   const apiKeys = getAllGroqKeys(req);
   if (apiKeys.length === 0) {
     res.status(400).json({ error: "Groq API key is required.", code: "MISSING_API_KEY" });
     return;
   }
-
   const { segments, sourceLanguage, targetLanguage, targetLanguageName, translationModel = "openai/gpt-oss-120b" } = req.body;
-
   if (!segments || !Array.isArray(segments) || segments.length === 0) {
     res.status(400).json({ error: "No segments provided" });
     return;
   }
-
   try {
-    const langPair = `${sourceLanguage} → ${targetLanguage}`;
+    const langPair = `${sourceLanguage} \u2192 ${targetLanguage}`;
     const prompt = `You are a professional subtitle translator. Translate each numbered segment below from ${langPair}. Keep the numbering and return ONLY the translated text lines, one per segment, preserving blank lines between segments.
 
-${segments.map((s: any, i: number) => `${i + 1}. ${s.originalText}`).join("\n")}`;
-
-    // Try the selected model first, then fallback models if it fails
+${segments.map((s, i) => `${i + 1}. ${s.originalText}`).join("\n")}`;
     const modelsToTry = [translationModel, "openai/gpt-oss-120b", "openai/gpt-oss-20b"].filter((m, i, arr) => arr.indexOf(m) === i);
-    let chatData: any = null;
-
+    let chatData = null;
     for (const model of modelsToTry) {
       try {
         const result = await fetchWithKeyFallback(
@@ -297,56 +258,44 @@ ${segments.map((s: any, i: number) => `${i + 1}. ${s.originalText}`).join("\n")}
               model,
               messages: [{ role: "user", content: prompt }],
               temperature: 0.1,
-              max_tokens: 4096,
-            }),
+              max_tokens: 4096
+            })
           }
         );
         if (result.res.ok) {
           chatData = await result.res.json();
           break;
         } else {
-          // Consume error body to avoid connection leak
           await result.res.text().catch(() => "");
           console.warn(`[Translate] Model ${model} returned ${result.res.status}`);
         }
-      } catch (err: any) {
+      } catch (err) {
         console.warn(`[Translate] Model ${model} failed:`, err?.message);
         continue;
       }
     }
-
     if (!chatData) {
       throw new Error("Translation failed: all models are unavailable");
     }
-
-    const translatedLines = (chatData.choices?.[0]?.message?.content || "")
-      .split("\n")
-      .map((l: string) => l.replace(/^\d+[\.\)]\s*/, "").trim())
-      .filter((l: string) => l.length > 0);
-
-    segments.forEach((seg: any, i: number) => {
+    const translatedLines = (chatData.choices?.[0]?.message?.content || "").split("\n").map((l) => l.replace(/^\d+[\.\)]\s*/, "").trim()).filter((l) => l.length > 0);
+    segments.forEach((seg, i) => {
       seg.translatedText = translatedLines[i] || seg.originalText;
     });
-
-    const fullTranslatedText = segments.map((s: any) => s.translatedText).join(" ");
+    const fullTranslatedText = segments.map((s) => s.translatedText).join(" ");
     const srtTranslated = buildSrt(segments, true);
     const vttTranslated = buildVtt(segments, true);
-
     res.json({ segments, fullTranslatedText, srtTranslated, vttTranslated, targetLanguage, targetLanguageName });
-  } catch (err: any) {
+  } catch (err) {
     console.error("Translation error:", err);
     res.status(500).json({ error: err.message || "Translation failed" });
   }
 });
-
-app.post("/api/tts", express.json(), async (req, res) => {
+app.post("/api/tts", import_express.default.json(), async (req, res) => {
   const { text, language = "km" } = req.body;
   if (!text || !text.trim()) {
     res.status(400).json({ error: "No text provided" });
     return;
   }
-
-  // 1. Try Google Translate TTS (free, supports 50+ languages including Khmer)
   try {
     const audioBuffer = await googleTTS(text.trim(), language);
     if (audioBuffer.length > 100) {
@@ -354,11 +303,9 @@ app.post("/api/tts", express.json(), async (req, res) => {
       res.send(audioBuffer);
       return;
     }
-  } catch (err: any) {
+  } catch (err) {
     console.warn(`[TTS] Google TTS failed for language ${language}:`, err?.message || err);
   }
-
-  // 2. Fallback: Groq Orpheus (English only, higher quality)
   const ttsKeys = getAllGroqKeys(req);
   for (const key of ttsKeys) {
     try {
@@ -366,14 +313,14 @@ app.post("/api/tts", express.json(), async (req, res) => {
         method: "POST",
         headers: {
           Authorization: `Bearer ${key}`,
-          "Content-Type": "application/json",
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({
           model: "canopylabs/orpheus-v1-english",
           input: text.trim(),
           voice: "troy",
-          response_format: "wav",
-        }),
+          response_format: "wav"
+        })
       });
       if (ttsRes.ok) {
         const audioBuffer = Buffer.from(await ttsRes.arrayBuffer());
@@ -382,46 +329,33 @@ app.post("/api/tts", express.json(), async (req, res) => {
         return;
       }
     } catch {
-      // try next key
     }
   }
-
-  // 3. All options exhausted - signal client to use browser TTS fallback
   res.status(204).end();
 });
-
-// Batch TTS: generate audio for all subtitle segments for AI dubbing
-app.post("/api/batch-tts", express.json(), async (req, res) => {
+app.post("/api/batch-tts", import_express.default.json(), async (req, res) => {
   const { segments, language = "km" } = req.body;
   if (!segments || !Array.isArray(segments) || segments.length === 0) {
     res.status(400).json({ error: "No segments provided" });
     return;
   }
-
   const ttsKeys = getAllGroqKeys(req);
   if (ttsKeys.length === 0) {
     res.status(200).json({ audio: [], fallback: true });
     return;
   }
-
-  const results: { id: number; start: number; end: number; audio: string }[] = [];
-
+  const results = [];
   for (const seg of segments) {
     if (!seg.translatedText?.trim()) continue;
-
     let audioBase64 = "";
-
-    // 1. Try Google Translate TTS (free, multilingual)
     try {
       const audioBuffer = await googleTTS(seg.translatedText.trim(), language);
       if (audioBuffer.length > 100) {
         audioBase64 = audioBuffer.toString("base64");
       }
-    } catch (err: any) {
+    } catch (err) {
       console.warn(`[BatchTTS] Google TTS failed for seg ${seg.id}:`, err?.message);
     }
-
-    // 2. Fallback: Groq Orpheus (English only)
     if (!audioBase64 && ttsKeys.length > 0) {
       for (const key of ttsKeys) {
         try {
@@ -429,14 +363,14 @@ app.post("/api/batch-tts", express.json(), async (req, res) => {
             method: "POST",
             headers: {
               Authorization: `Bearer ${key}`,
-              "Content-Type": "application/json",
+              "Content-Type": "application/json"
             },
             body: JSON.stringify({
               model: "canopylabs/orpheus-v1-english",
               input: seg.translatedText.trim(),
               voice: "troy",
-              response_format: "wav",
-            }),
+              response_format: "wav"
+            })
           });
           if (ttsRes.ok) {
             const buf = Buffer.from(await ttsRes.arrayBuffer());
@@ -446,141 +380,138 @@ app.post("/api/batch-tts", express.json(), async (req, res) => {
             }
           }
         } catch {
-          // try next key
         }
       }
     }
-
     results.push({
       id: seg.id,
       start: seg.start,
       end: seg.end,
-      audio: audioBase64,
+      audio: audioBase64
     });
   }
-
   res.json({ audio: results, fallback: false });
 });
-
-// --- Video Rendering: Convert WebM → MP4 (H.264 + AAC + yuv420p + faststart) ---
 app.post("/api/render-mp4", uploadLarge.single("video"), async (req, res) => {
   const file = req.file;
   if (!file) {
     res.status(400).json({ error: "No video file provided" });
     return;
   }
-
-  const tmpDir = await mkdtemp(join(tmpdir(), "render-"));
-  const inputPath = join(tmpDir, "input.webm");
-  const outputPath = join(tmpDir, "output.mp4");
-
+  const tmpDir = await (0, import_promises.mkdtemp)((0, import_path.join)((0, import_os.tmpdir)(), "render-"));
+  const inputPath = (0, import_path.join)(tmpDir, "input.webm");
+  const outputPath = (0, import_path.join)(tmpDir, "output.mp4");
   try {
-    // Write uploaded WebM to temp file
-    await writeFile(inputPath, file.buffer);
-
-    console.log(`[RenderMP4] Converting ${file.originalname} (${(file.size / 1024 / 1024).toFixed(1)}MB) → MP4...`);
-
-    // FFmpeg: WebM → MP4 with H.264 + AAC + yuv420p + faststart
+    await (0, import_promises.writeFile)(inputPath, file.buffer);
+    console.log(`[RenderMP4] Converting ${file.originalname} (${(file.size / 1024 / 1024).toFixed(1)}MB) \u2192 MP4...`);
     await execFileAsync("ffmpeg", [
-      "-i", inputPath,
-      "-c:v", "libx264",
-      "-preset", "fast",
-      "-crf", "23",
-      "-pix_fmt", "yuv420p",
-      "-c:a", "aac",
-      "-b:a", "192k",
-      "-movflags", "+faststart",
+      "-i",
+      inputPath,
+      "-c:v",
+      "libx264",
+      "-preset",
+      "fast",
+      "-crf",
+      "23",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "192k",
+      "-movflags",
+      "+faststart",
       "-y",
-      outputPath,
-    ], { timeout: 120_000 });
-
-    // Validate the output
+      outputPath
+    ], { timeout: 12e4 });
     const { stdout: probeStdout } = await execFileAsync("ffprobe", [
-      "-v", "error",
-      "-select_streams", "v:0",
-      "-show_entries", "stream=codec_name,width,height,duration",
-      "-of", "json",
-      outputPath,
-    ], { timeout: 10_000 });
-
+      "-v",
+      "error",
+      "-select_streams",
+      "v:0",
+      "-show_entries",
+      "stream=codec_name,width,height,duration",
+      "-of",
+      "json",
+      outputPath
+    ], { timeout: 1e4 });
     const probeData = JSON.parse(probeStdout);
     const videoStream = probeData.streams?.[0];
-
     if (!videoStream || !videoStream.codec_name) {
       throw new Error("FFmpeg produced no valid video stream");
     }
-
-    // Check audio stream exists
     const { stdout: audioProbe } = await execFileAsync("ffprobe", [
-      "-v", "error",
-      "-select_streams", "a:0",
-      "-show_entries", "stream=codec_name",
-      "-of", "json",
-      outputPath,
-    ], { timeout: 10_000 });
+      "-v",
+      "error",
+      "-select_streams",
+      "a:0",
+      "-show_entries",
+      "stream=codec_name",
+      "-of",
+      "json",
+      outputPath
+    ], { timeout: 1e4 });
     const audioData = JSON.parse(audioProbe);
     if (!audioData.streams?.[0]) {
       throw new Error("FFmpeg produced no valid audio stream");
     }
-
-    const mp4Buffer = await readFile(outputPath);
-    if (mp4Buffer.length < 1000) {
+    const mp4Buffer = await (0, import_promises.readFile)(outputPath);
+    if (mp4Buffer.length < 1e3) {
       throw new Error("Output MP4 is too small to be valid");
     }
-
-    const now = new Date();
-    const filename = `translated-khmer-${now.getFullYear()}${String(now.getMonth()+1).padStart(2,"0")}${String(now.getDate()).padStart(2,"0")}-${String(now.getHours()).padStart(2,"0")}${String(now.getMinutes()).padStart(2,"0")}.mp4`;
-
+    const now = /* @__PURE__ */ new Date();
+    const filename = `translated-khmer-${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}-${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}.mp4`;
     console.log(`[RenderMP4] Success: ${filename} (${(mp4Buffer.length / 1024 / 1024).toFixed(1)}MB, ${videoStream.width}x${videoStream.height}, ${videoStream.codec_name}+${audioData.streams[0].codec_name})`);
-
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
     res.send(mp4Buffer);
-  } catch (err: any) {
+  } catch (err) {
     console.error("[RenderMP4] Error:", err);
     res.status(500).json({ error: err.message || "Video export failed. Please try again." });
   } finally {
-    // Clean up temp files
-    try { await unlink(inputPath); } catch {}
-    try { await unlink(outputPath); } catch {}
-    try { await import("fs/promises").then(fs => fs.rm(tmpDir, { recursive: true, force: true })); } catch {}
+    try {
+      await (0, import_promises.unlink)(inputPath);
+    } catch {
+    }
+    try {
+      await (0, import_promises.unlink)(outputPath);
+    } catch {
+    }
+    try {
+      await import("fs/promises").then((fs) => fs.rm(tmpDir, { recursive: true, force: true }));
+    } catch {
+    }
   }
 });
-
-// --- Helper functions ---
-
-function formatSrtTime(t: number): string {
-  const ms = Math.floor((t % 1) * 1000);
+function formatSrtTime(t) {
+  const ms = Math.floor(t % 1 * 1e3);
   const total = Math.floor(t);
   const s = total % 60;
   const m = Math.floor(total / 60) % 60;
   const h = Math.floor(total / 3600);
   return `${p(h)}:${p(m)}:${p(s)},${p(ms, 3)}`;
 }
-
-function formatVttTime(t: number): string {
-  const ms = Math.floor((t % 1) * 1000);
+function formatVttTime(t) {
+  const ms = Math.floor(t % 1 * 1e3);
   const total = Math.floor(t);
   const s = total % 60;
   const m = Math.floor(total / 60) % 60;
   const h = Math.floor(total / 3600);
   return `${p(h)}:${p(m)}:${p(s)}.${p(ms, 3)}`;
 }
-
-function p(n: number, w = 2): string {
+function p(n, w = 2) {
   return String(n).padStart(w, "0");
 }
-
-function buildSrt(segments: any[], useTranslation: boolean): string {
-  return segments
-    .map((seg, i) => {
-      const text = useTranslation ? seg.translatedText : seg.originalText;
-      return `${i + 1}\n${formatSrtTime(seg.start)} --> ${formatSrtTime(seg.end)}\n${text.trim()}\n`;
-    })
-    .join("\n");
+function buildSrt(segments, useTranslation) {
+  return segments.map((seg, i) => {
+    const text = useTranslation ? seg.translatedText : seg.originalText;
+    return `${i + 1}
+${formatSrtTime(seg.start)} --> ${formatSrtTime(seg.end)}
+${text.trim()}
+`;
+  }).join("\n");
 }
-
-function buildVtt(segments: any[], useTranslation: boolean): string {
+function buildVtt(segments, useTranslation) {
   const lines = ["WEBVTT", ""];
   segments.forEach((seg, i) => {
     const text = useTranslation ? seg.translatedText : seg.originalText;
@@ -591,20 +522,15 @@ function buildVtt(segments: any[], useTranslation: boolean): string {
   });
   return lines.join("\n");
 }
-
-// --- Vite Dev Middleware ---
-
 async function startServer() {
-  const vite = await createViteServer({
+  const vite = await (0, import_vite.createServer)({
     server: { middlewareMode: true },
-    appType: "spa",
+    appType: "spa"
   });
-
   app.use(vite.middlewares);
-
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running at http://0.0.0.0:${PORT}`);
   });
 }
-
 startServer();
+//# sourceMappingURL=server.cjs.map

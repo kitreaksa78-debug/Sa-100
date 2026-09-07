@@ -85,7 +85,7 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
   });
 
   return (
-    <div className="bg-white rounded-2xl border border-stone-200 shadow-xs flex flex-col h-[520px] overflow-hidden">
+    <div className="bg-white rounded-2xl border border-stone-200 shadow-xs flex flex-col h-[360px] sm:h-[480px] lg:h-[520px] overflow-hidden">
       {/* Top Header with view toggles & search */}
       <div className="p-3.5 border-b border-stone-100 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 bg-stone-50/50">
         {/* View Mode Switcher */}
