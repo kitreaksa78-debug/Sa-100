@@ -94,7 +94,7 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
             id="view-mode-split"
             type="button"
             onClick={() => setViewMode('split')}
-            className={`px-3 py-1 text-xs font-semibold rounded-lg transition-all ${
+            className={`px-2.5 py-1 text-xs font-semibold rounded-lg transition-all whitespace-nowrap ${
               viewMode === 'split'
                 ? 'bg-white text-stone-900 shadow-xs'
                 : 'text-stone-600 hover:text-stone-900'
@@ -106,7 +106,7 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
             id="view-mode-translated"
             type="button"
             onClick={() => setViewMode('translated')}
-            className={`px-3 py-1 text-xs font-semibold rounded-lg transition-all ${
+            className={`px-2.5 py-1 text-xs font-semibold rounded-lg transition-all whitespace-nowrap ${
               viewMode === 'translated'
                 ? 'bg-white text-stone-900 shadow-xs'
                 : 'text-stone-600 hover:text-stone-900'
@@ -118,7 +118,7 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
             id="view-mode-original"
             type="button"
             onClick={() => setViewMode('original')}
-            className={`px-3 py-1 text-xs font-semibold rounded-lg transition-all ${
+            className={`px-2.5 py-1 text-xs font-semibold rounded-lg transition-all whitespace-nowrap ${
               viewMode === 'original'
                 ? 'bg-white text-stone-900 shadow-xs'
                 : 'text-stone-600 hover:text-stone-900'
