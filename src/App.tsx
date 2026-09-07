@@ -8,12 +8,14 @@ import {
   CheckCircle,
   HelpCircle,
   ShieldAlert,
+  Film,
+  Download,
 } from 'lucide-react';
 import { Header } from './components/Header';
 import { ApiKeyModal } from './components/ApiKeyModal';
 import { MediaUploader } from './components/MediaUploader';
 import { OptionsBar } from './components/OptionsBar';
-import { MediaPlayer } from './components/MediaPlayer';
+import { MediaPlayer, MediaPlayerHandle } from './components/MediaPlayer';
 import { TranscriptView } from './components/TranscriptView';
 import { ExportToolbar } from './components/ExportToolbar';
 import { UILang, UI_TEXT } from './data/translations';
@@ -57,6 +59,41 @@ export default function App() {
   // Media playback tracking
   const [currentTime, setCurrentTime] = useState(0);
   const mediaPlayerRef = useRef<HTMLVideoElement | HTMLAudioElement | null>(null);
+  const mediaPlayerHandleRef = useRef<MediaPlayerHandle>(null);
+
+  // AI Voice Dubbing state
+  const [isGeneratingDubbing, setIsGeneratingDubbing] = useState(false);
+  const [dubbingProgress, setDubbingProgress] = useState<number>(0);
+  const [dubbingTotal, setDubbingTotal] = useState<number>(0);
+  const [muteOriginal, setMuteOriginal] = useState(false);
+
+  // Export dubbed video state
+  const [isExportingDubbed, setIsExportingDubbed] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
+  // Rendered (AI-dubbed) video ready for preview & download
+  const [exportedResult, setExportedResult] = useState<{
+    url: string;
+    ext: string;
+    size: number;
+    filename: string;
+  } | null>(null);
+
+  const clearExportedResult = () => {
+    setExportedResult((prev) => {
+      if (prev) URL.revokeObjectURL(prev.url);
+      return null;
+    });
+  };
+
+  const handleDownloadExported = () => {
+    if (!exportedResult) return;
+    const a = document.createElement('a');
+    a.href = exportedResult.url;
+    a.download = exportedResult.filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
 
   // Fetch server status on mount
   useEffect(() => {
@@ -95,6 +132,7 @@ export default function App() {
     setMediaType(sample.type);
     setCurrentTime(0);
     setErrorMessage(null);
+    clearExportedResult();
 
     // Compute SRT and VTT for sample initial result
     const srtOriginal = exportToSrt(sample.initialResult.segments, false);
@@ -293,6 +331,118 @@ export default function App() {
     }
   };
 
+  // Generate AI Voice Dubbing for all segments
+  const handleGenerateDubbing = async () => {
+    if (!result || !result.segments || result.segments.length === 0) return;
+    if (!isGroqActive) {
+      setIsApiKeyModalOpen(true);
+      return;
+    }
+
+    setIsGeneratingDubbing(true);
+    setDubbingProgress(0);
+    setDubbingTotal(result.segments.length);
+    setErrorMessage(null);
+
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (groqKey.trim()) {
+        headers['x-groq-api-key'] = groqKey.trim();
+      }
+
+      // Process segments in batches of 5 to show progress
+      const BATCH_SIZE = 5;
+      const allSegments = [...result.segments];
+      const dubbedSegments: SubtitleSegment[] = [];
+
+      for (let i = 0; i < allSegments.length; i += BATCH_SIZE) {
+        const batch = allSegments.slice(i, i + BATCH_SIZE);
+        const res = await fetch('/api/batch-tts', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            segments: batch,
+            language: result.targetLanguage,
+          }),
+        });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error || 'Failed to generate AI voice');
+        }
+
+        const data = await res.json();
+        if (data.fallback) {
+          throw new Error('No API keys available for TTS generation');
+        }
+
+        // Merge dubbed audio into segments
+        batch.forEach((seg, idx) => {
+          const audioData = data.audio.find((a: any) => a.id === seg.id);
+          dubbedSegments.push({
+            ...seg,
+            dubbedAudioBase64: audioData?.audio || '',
+          });
+        });
+
+        setDubbingProgress(Math.min(i + BATCH_SIZE, allSegments.length));
+      }
+
+      // Update result with dubbed audio
+      setResult((prev) => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          segments: dubbedSegments,
+        };
+      });
+
+      // Auto-enable AI voice dubbing and mute original
+      setMuteOriginal(true);
+    } catch (err: any) {
+      console.error('Dubbing generation error:', err);
+      setErrorMessage(err.message || 'Error generating AI voice');
+    } finally {
+      setIsGeneratingDubbing(false);
+    }
+  };
+
+  // Export the dubbed video file (video + AI voice mix burned in)
+  const handleExportDubbed = async () => {
+    if (!mediaPlayerHandleRef.current || isExportingDubbed) return;
+    if (!result?.segments.some((s) => s.dubbedAudioBase64)) {
+      setErrorMessage(t.exportDubbedFailed);
+      return;
+    }
+
+    setIsExportingDubbed(true);
+    setExportProgress(0);
+    setErrorMessage(null);
+
+    try {
+      const out = await mediaPlayerHandleRef.current.exportDubbed((p) => setExportProgress(p));
+      if (!out) {
+        throw new Error(t.exportDubbedFailed);
+      }
+      const url = URL.createObjectURL(out.blob);
+      setExportedResult((prev) => {
+        if (prev) URL.revokeObjectURL(prev.url);
+        return {
+          url,
+          ext: out.ext,
+          size: out.blob.size,
+          filename: `dubbed-${result.targetLanguage}-${Date.now()}.${out.ext}`,
+        };
+      });
+    } catch (err: any) {
+      console.error('Export dubbed error:', err);
+      setErrorMessage(err.message || t.exportDubbedFailed);
+    } finally {
+      setIsExportingDubbed(false);
+      setExportProgress(0);
+    }
+  };
+
   // Update segments after user inline edits
   const handleUpdateSegments = (updated: SubtitleSegment[]) => {
     if (!result) return;
@@ -321,41 +471,11 @@ export default function App() {
       <Header
         uiLang={uiLang}
         setUiLang={setUiLang}
-        groqConnected={isGroqActive}
-        onOpenApiKeyModal={() => setIsApiKeyModalOpen(true)}
       />
 
       {/* Main Workspace */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 space-y-6">
-        {/* Banner if Groq API key is needed */}
-        {!isGroqActive && (
-          <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-amber-900 shadow-xs">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-xl bg-amber-100 text-amber-700 shrink-0">
-                <KeyRound className="w-5 h-5" />
-              </div>
-              <div>
-                <h3 className="text-sm font-bold">
-                  {uiLang === 'km' ? 'ត្រូវការ Groq API Key' : 'Groq API Key Required'}
-                </h3>
-                <p className="text-xs text-amber-700">
-                  {uiLang === 'km'
-                    ? 'សូមចុចប៊ូតុងខាងស្តាំ ដើម្បីបញ្ចូល Groq API Key (ឥតគិតថ្លៃ) ឬកំណត់ក្នុងឯកសារ .env'
-                    : 'Please enter your Groq API Key to enable ultra-fast Whisper & Llama models.'}
-                </p>
-              </div>
-            </div>
-
-            <button
-              id="banner-open-groq-key-btn"
-              type="button"
-              onClick={() => setIsApiKeyModalOpen(true)}
-              className="px-4 py-2 rounded-xl text-xs font-bold bg-amber-600 hover:bg-amber-700 text-white shadow-xs shrink-0 transition-colors"
-            >
-              {t.groqKeySettings}
-            </button>
-          </div>
-        )}
+        {/* No API key banner needed - keys are configured via environment */}
 
         {/* Error notification */}
         {errorMessage && (
@@ -382,6 +502,7 @@ export default function App() {
             setSelectedFile(f);
             setResult(null);
             setErrorMessage(null);
+            clearExportedResult();
           }}
           mediaPreviewUrl={mediaPreviewUrl}
           setMediaPreviewUrl={setMediaPreviewUrl}
@@ -429,7 +550,61 @@ export default function App() {
               onRetranslate={handleRetranslate}
               isRetranslating={isRetranslating}
               uiLang={uiLang}
+              onGenerateDubbing={handleGenerateDubbing}
+              isGeneratingDubbing={isGeneratingDubbing}
+              dubbingProgress={dubbingProgress}
+              dubbingTotal={dubbingTotal}
+              onExportDubbed={handleExportDubbed}
+              isExportingDubbed={isExportingDubbed}
+              exportProgress={exportProgress}
             />
+
+            {/* AI-Rendered Video Preview (watch the final dubbed video & download) */}
+            {exportedResult && (
+              <div className="bg-white rounded-2xl border border-indigo-200 shadow-xs p-4 sm:p-5 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <span className="w-8 h-8 rounded-lg bg-indigo-100 text-indigo-600 flex items-center justify-center shrink-0">
+                      <Film className="w-4 h-4" />
+                    </span>
+                    <div className="min-w-0">
+                      <h3 className="text-xs font-bold text-stone-800">{t.renderedTitle}</h3>
+                      <p className="text-[11px] text-stone-500 font-mono truncate">
+                        {exportedResult.filename} · {(exportedResult.size / (1024 * 1024)).toFixed(2)} MB
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      id="download-rendered-video-btn"
+                      type="button"
+                      onClick={handleDownloadExported}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-semibold bg-gradient-to-r from-indigo-600 to-violet-600 text-white hover:from-indigo-700 hover:to-violet-700 shadow-sm transition-all"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>
+                        {t.downloadRendered} ({exportedResult.ext.toUpperCase()})
+                      </span>
+                    </button>
+                    <button
+                      id="discard-rendered-video-btn"
+                      type="button"
+                      onClick={clearExportedResult}
+                      className="inline-flex items-center px-3 py-1.5 rounded-xl text-xs font-semibold border border-stone-200 bg-stone-50 text-stone-600 hover:bg-stone-100 transition-all"
+                    >
+                      <span>{t.discardRendered}</span>
+                    </button>
+                  </div>
+                </div>
+                <video
+                  controls
+                  playsInline
+                  src={exportedResult.url}
+                  className="w-full max-h-[70vh] rounded-xl bg-black"
+                />
+                <p className="text-[11px] text-indigo-600 font-medium">✅ {t.renderedReady}</p>
+              </div>
+            )}
 
             {/* Split Screen: Media Player + Interactive Transcript View */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -445,6 +620,7 @@ export default function App() {
                 </div>
 
                 <MediaPlayer
+                  ref={mediaPlayerHandleRef}
                   mediaUrl={mediaPreviewUrl}
                   mediaType={mediaType}
                   segments={result.segments}
@@ -453,6 +629,8 @@ export default function App() {
                   mediaPlayerRef={mediaPlayerRef}
                   targetLangCode={result.targetLanguage}
                   uiLang={uiLang}
+                  muteOriginal={muteOriginal}
+                  setMuteOriginal={setMuteOriginal}
                 />
               </div>
 
@@ -481,15 +659,7 @@ export default function App() {
         )}
       </main>
 
-      {/* Groq API Key Modal */}
-      <ApiKeyModal
-        isOpen={isApiKeyModalOpen}
-        onClose={() => setIsApiKeyModalOpen(false)}
-        apiKey={groqKey}
-        onSaveKey={handleSaveApiKey}
-        serverGroqConfigured={serverStatus.groqConfigured}
-        uiLang={uiLang}
-      />
+
     </div>
   );
 }

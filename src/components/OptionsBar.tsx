@@ -111,10 +111,10 @@ export const OptionsBar: React.FC<OptionsBarProps> = ({
             disabled={isProcessing}
             className="w-full px-3 py-2 text-xs font-medium rounded-xl border border-stone-300 bg-stone-50/60 focus:outline-none focus:ring-2 focus:ring-orange-500"
           >
-            <option value="openai/gpt-oss-120b">GPT OSS 120B (High Quality & Context)</option>
-            <option value="openai/gpt-oss-20b">GPT OSS 20B (Ultra Fast)</option>
-            <option value="llama-3.3-70b-versatile">Llama 3.3 70B (Meta Llama)</option>
-            <option value="llama-3.1-8b-instant">Llama 3.1 8B (Fast)</option>
+            <option value="openai/gpt-oss-120b">GPT-OSS 120B (High Quality)</option>
+            <option value="openai/gpt-oss-20b">GPT-OSS 20B (Ultra Fast)</option>
+            <option value="llama-3.3-70b-versatile">Llama 3.3 70B (Enterprise)</option>
+            <option value="llama-3.1-8b-instant">Llama 3.1 8B (Enterprise)</option>
           </select>
         </div>
       </div>

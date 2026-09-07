@@ -3,5 +3,37 @@
 @layer base {
   body {
     font-family: 'Kantumruy Pro', 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+  }
+  /* Smooth scrolling on iOS/Android */
+  * {
+    -webkit-overflow-scrolling: touch;
+  }
+  /* Larger touch targets for range inputs (sliders) */
+  input[type='range'] {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 6px;
+    min-height: 4px;
+  }
+  input[type='range']::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    cursor: pointer;
+  }
+  input[type='range']::-moz-range-thumb {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: none;
+    cursor: pointer;
+  }
+  /* Prevent text selection on buttons/controls */
+  button {
+    -webkit-user-select: none;
+    user-select: none;
   }
 }

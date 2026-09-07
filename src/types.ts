@@ -4,6 +4,8 @@ export interface SubtitleSegment {
   end: number;
   originalText: string;
   translatedText: string;
+  /** Base64-encoded audio for AI dubbing (populated after batch TTS) */
+  dubbedAudioBase64?: string;
 }
 
 export interface TranscriptionResult {
