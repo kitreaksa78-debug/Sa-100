@@ -143,7 +143,7 @@ export const MediaUploader: React.FC<MediaUploaderProps> = ({
   };
 
   return (
-    <div className="bg-white rounded-2xl border border-stone-200 shadow-xs overflow-hidden">
+    <div className="bg-white rounded-2xl border border-stone-200/80 shadow-sm shadow-stone-200/50 overflow-hidden">
       {/* Navigation Tabs */}
       <div className="flex border-b border-stone-100 bg-stone-50/50 p-1.5 gap-1">
         <button
@@ -195,18 +195,18 @@ export const MediaUploader: React.FC<MediaUploaderProps> = ({
       <div className="p-4 sm:p-6">
         {/* Upload File Tab */}
         {activeTab === 'upload' && (
-          <div
-            id="dropzone-area"
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
-            onDrop={handleDrop}
-            className={`border-2 border-dashed rounded-2xl p-6 sm:p-8 text-center transition-all cursor-pointer ${
-              isDragging
-                ? 'border-orange-500 bg-orange-50/50 scale-[0.99]'
-                : 'border-stone-200 hover:border-orange-400 hover:bg-stone-50/50'
-            }`}
-            onClick={() => fileInputRef.current?.click()}
-          >
+        <div
+          id="dropzone-area"
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+          className={`border-2 border-dashed rounded-2xl p-8 sm:p-10 text-center transition-all cursor-pointer ${
+            isDragging
+              ? 'border-orange-400 bg-gradient-to-br from-orange-50 to-amber-50/50 scale-[0.99] shadow-inner shadow-orange-100'
+              : 'border-stone-200 hover:border-orange-300 hover:bg-gradient-to-br hover:from-stone-50 hover:to-orange-50/30 hover:shadow-inner hover:shadow-stone-100'
+          }`}
+          onClick={() => fileInputRef.current?.click()}
+        >
             <input
               ref={fileInputRef}
               type="file"
@@ -220,7 +220,7 @@ export const MediaUploader: React.FC<MediaUploaderProps> = ({
               }}
             />
 
-            <div className="w-14 h-14 mx-auto mb-3.5 rounded-2xl bg-orange-100 text-orange-600 flex items-center justify-center shadow-xs">
+            <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-gradient-to-br from-orange-100 to-amber-50 text-orange-600 flex items-center justify-center shadow-sm shadow-orange-200/50 ring-1 ring-orange-200/50">
               <Upload className="w-7 h-7" />
             </div>
 
@@ -231,7 +231,7 @@ export const MediaUploader: React.FC<MediaUploaderProps> = ({
               type="button"
               id="browse-files-btn"
               disabled={disabled}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold bg-stone-900 text-white hover:bg-stone-800 transition-colors shadow-xs"
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs sm:text-sm font-semibold bg-gradient-to-r from-stone-900 to-stone-800 text-white hover:from-stone-800 hover:to-stone-700 transition-all shadow-sm hover:shadow-md shadow-stone-900/20 active:scale-[0.98]"
             >
               <FileCheck className="w-4 h-4" />
               {t.browseFiles}

@@ -35,7 +35,7 @@ export const OptionsBar: React.FC<OptionsBarProps> = ({
   const t = UI_TEXT[uiLang];
 
   return (
-    <div className="bg-white rounded-2xl border border-stone-200 shadow-xs p-4 sm:p-5 space-y-4">
+    <div className="bg-white rounded-2xl border border-stone-200/80 shadow-sm shadow-stone-200/50 p-4 sm:p-5 space-y-4">
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
         {/* Source Audio Language */}
         <div>
@@ -135,7 +135,7 @@ export const OptionsBar: React.FC<OptionsBarProps> = ({
           type="button"
           disabled={!canProcess || isProcessing}
           onClick={onTranscribeAndTranslate}
-          className="w-full sm:w-auto inline-flex items-center justify-center gap-2.5 px-6 py-2.5 rounded-xl text-sm font-bold bg-orange-600 hover:bg-orange-700 text-white shadow-md transition-all disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer active:scale-98"
+          className="w-full sm:w-auto inline-flex items-center justify-center gap-2.5 px-6 py-2.5 rounded-xl text-sm font-bold bg-gradient-to-r from-orange-600 to-amber-500 hover:from-orange-700 hover:to-amber-600 text-white shadow-md shadow-orange-500/25 transition-all disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer active:scale-[0.98] ring-1 ring-orange-500/20"
         >
           {isProcessing ? (
             <>

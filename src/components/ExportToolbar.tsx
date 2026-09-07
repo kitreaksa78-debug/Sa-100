@@ -97,7 +97,7 @@ export const ExportToolbar: React.FC<ExportToolbarProps> = ({
   const hasDubbedAudio = result.segments.some((s) => s.dubbedAudioBase64);
 
   return (
-    <div className="bg-white rounded-2xl border border-stone-200 shadow-xs p-4 sm:p-5 space-y-4">
+    <div className="bg-white rounded-2xl border border-stone-200/80 shadow-sm shadow-stone-200/50 p-4 sm:p-5 space-y-4">
       <div className="flex flex-col sm:flex-row sm:flex-wrap items-stretch sm:items-center justify-between gap-2 sm:gap-3">
         {/* Statistics & Badges */}
         <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
@@ -244,7 +244,7 @@ export const ExportToolbar: React.FC<ExportToolbarProps> = ({
             id="download-srt-translated"
             type="button"
             onClick={() => handleDownloadSrt(true)}
-            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-semibold bg-stone-900 text-white hover:bg-stone-800 shadow-xs transition-colors"
+            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-semibold bg-gradient-to-r from-stone-800 to-stone-900 text-white hover:from-stone-700 hover:to-stone-800 shadow-sm shadow-stone-900/20 transition-all active:scale-[0.98]"
           >
             <Download className="w-3.5 h-3.5" />
             <span>{t.exportSrt}</span>

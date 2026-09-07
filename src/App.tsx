@@ -90,9 +90,14 @@ export default function App() {
     const a = document.createElement('a');
     a.href = exportedResult.url;
     a.download = exportedResult.filename;
+    a.style.display = 'none';
+    a.rel = 'noopener';
     document.body.appendChild(a);
     a.click();
-    document.body.removeChild(a);
+    // Delay removal so the browser has time to start the download
+    setTimeout(() => {
+      document.body.removeChild(a);
+    }, 200);
   };
 
   // Fetch server status on mount
@@ -466,7 +471,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-stone-100/70 text-stone-900 flex flex-col font-sans">
+    <div className="min-h-screen text-stone-900 flex flex-col font-sans">
       {/* Header */}
       <Header
         uiLang={uiLang}
