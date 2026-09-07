@@ -23,6 +23,7 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 
 // server.ts
 var import_config = require("dotenv/config");
+var import_dotenv = __toESM(require("dotenv"), 1);
 var import_express = __toESM(require("express"), 1);
 var import_multer = __toESM(require("multer"), 1);
 var import_vite = require("vite");
@@ -32,16 +33,25 @@ var import_util = require("util");
 var import_promises = require("fs/promises");
 var import_os = require("os");
 var import_path = require("path");
+import_dotenv.default.config({ path: ".env.local" });
 var execFileAsync = (0, import_util.promisify)(import_child_process.execFile);
 var PORT = Number(process.env.PORT) || 5173;
 var app = (0, import_express.default)();
-var upload = (0, import_multer.default)({ storage: import_multer.default.memoryStorage(), limits: { fileSize: 26214400 } });
+var upload = (0, import_multer.default)({ storage: import_multer.default.memoryStorage(), limits: { fileSize: 52428800 } });
 var uploadLarge = (0, import_multer.default)({ storage: import_multer.default.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
+var envKeyOrder = ["GROQ_API_KEY", "GROQ_API_KEY2", "GROQ_API_KEY3"];
+function rotateKeyToBack(key) {
+  const idx = envKeyOrder.findIndex((name) => process.env[name]?.trim() === key);
+  if (idx >= 0 && envKeyOrder.length > 1) {
+    const [name] = envKeyOrder.splice(idx, 1);
+    envKeyOrder.push(name);
+  }
+}
 function getAllGroqKeys(req) {
   const keys = [];
   const headerKey = req.headers["x-groq-api-key"];
   if (headerKey?.trim()) keys.push(headerKey.trim());
-  for (const envKey of ["GROQ_API_KEY", "GROQ_API_KEY2", "GROQ_API_KEY3"]) {
+  for (const envKey of envKeyOrder) {
     const val = process.env[envKey]?.trim();
     if (val && !keys.includes(val)) keys.push(val);
   }
@@ -59,14 +69,140 @@ async function fetchWithKeyFallback(url, keys, options) {
       const errBody = await res.text().catch(() => "");
       if (res.status === 429 || res.status >= 500 || res.status === 404 || res.status === 403) {
         lastErr = new Error(`HTTP ${res.status} with key ...${key.slice(-6)}: ${errBody.slice(0, 200)}`);
+        rotateKeyToBack(key);
         continue;
       }
       return { res, key };
     } catch (err) {
       lastErr = err;
+      rotateKeyToBack(key);
     }
   }
   throw lastErr || new Error("All API keys failed");
+}
+var DEFAULT_TRANSLATION_MODEL = "openai/gpt-oss-120b";
+var TARGET_SCRIPT = {
+  km: /[\u1780-\u17FF]/,
+  zh: /[\u4E00-\u9FFF]/,
+  ja: /[\u3040-\u30FF\u4E00-\u9FFF]/,
+  ko: /[\uAC00-\uD7AF]/,
+  th: /[\u0E00-\u0E7F]/,
+  ru: /[\u0400-\u04FF]/,
+  ar: /[\u0600-\u06FF]/,
+  hi: /[\u0900-\u097F]/
+};
+function lineInTargetScript(line, targetLanguage) {
+  const regex = TARGET_SCRIPT[targetLanguage];
+  if (!regex) return true;
+  return regex.test(line);
+}
+function parseTranslatedLines(content) {
+  const trimmed = content.trim();
+  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+    try {
+      const arr = JSON.parse(trimmed);
+      if (Array.isArray(arr)) {
+        return arr.map((x) => typeof x === "string" ? x.trim() : String(x).trim()).filter((l) => l.length > 0);
+      }
+    } catch {
+    }
+  }
+  return content.split("\n").map(
+    (l) => l.replace(/^\s*(?:\d+\s*[\.\)\]:]|[-*•])\s*/, "").replace(/^["'“”‘’]+|["'“”‘’]+$/g, "").trim()
+  ).filter((l) => l.length > 0);
+}
+function buildTranslationPrompt(sourceLanguage, targetLanguage, targetLanguageName, segments) {
+  const langPair = `${sourceLanguage} \u2192 ${targetLanguage}`;
+  const fullText = segments.map((s) => s.originalText || "").join(" ");
+  const numbered = segments.map((s, i) => `${i + 1}. ${s.originalText || ""}`).join("\n");
+  return `You are a professional subtitle translator. Translate each numbered segment below from ${langPair} (${targetLanguageName || targetLanguage}). Every translated line MUST be written in the target language (${targetLanguage}) script \u2014 never repeat the source-language text. Use the full transcript below as context so short or ambiguous segments are translated naturally and consistently. Keep the numbering and return ONLY the translated text lines, one per segment, preserving blank lines between segments.
+
+Full transcript: "${fullText}"
+
+${numbered}`;
+}
+function buildForcedTranslationPrompt(sourceLanguage, targetLanguage, targetLanguageName, segments) {
+  const numbered = segments.map((s, i) => `${i + 1}. ${s.originalText || ""}`).join("\n");
+  return `Translate the following subtitle segments from ${sourceLanguage} to ${targetLanguage} (${targetLanguageName || targetLanguage}). Every line MUST be written in the target language's script \u2014 never repeat the original-language text. Return one translation per line, numbered to match the input, with no extra text.
+
+${numbered}`;
+}
+async function tryChatModels(apiKeys, model, prompt) {
+  const modelsToTry = [model, "openai/gpt-oss-120b", "openai/gpt-oss-20b"].filter((m, i, arr) => arr.indexOf(m) === i);
+  for (const candidate of modelsToTry) {
+    try {
+      const result = await fetchWithKeyFallback(
+        "https://api.groq.com/openai/v1/chat/completions",
+        apiKeys,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: candidate,
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.1,
+            max_tokens: 4096
+          })
+        }
+      );
+      if (result.res.ok) {
+        return await result.res.json();
+      }
+      await result.res.text().catch(() => "");
+      console.warn(`[Translate] Model ${candidate} returned ${result.res.status}`);
+    } catch (err) {
+      console.warn(`[Translate] Model ${candidate} failed:`, err?.message);
+      continue;
+    }
+  }
+  return null;
+}
+async function translateSegmentsWithFallback(apiKeys, model, sourceLanguage, targetLanguage, targetLanguageName, segments) {
+  const lines = [];
+  let pending = segments.map((_, i) => i);
+  const runPass = async (m, buildPrompt) => {
+    if (pending.length === 0) return;
+    const prompt = buildPrompt(pending.map((i) => segments[i]));
+    const chatData = await tryChatModels(apiKeys, m, prompt);
+    const got = chatData ? parseTranslatedLines(chatData.choices?.[0]?.message?.content || "") : [];
+    const still = [];
+    pending.forEach((idx, j) => {
+      if (j < got.length && got[j].trim() && lineInTargetScript(got[j], targetLanguage)) {
+        lines[idx] = got[j];
+      } else {
+        still.push(idx);
+      }
+    });
+    pending = still;
+  };
+  await runPass(
+    model,
+    (sub) => buildTranslationPrompt(sourceLanguage, targetLanguage, targetLanguageName, sub)
+  );
+  await runPass(
+    model,
+    (sub) => buildForcedTranslationPrompt(sourceLanguage, targetLanguage, targetLanguageName, sub)
+  );
+  const alternatives = [
+    DEFAULT_TRANSLATION_MODEL,
+    "qwen/qwen3.8-27b",
+    "qwen/qwen3.6-27b",
+    "groq/compound-mini",
+    "openai/gpt-oss-20b"
+  ].filter((m, i, arr) => arr.indexOf(m) === i && m !== model);
+  for (const alt of alternatives) {
+    if (pending.length === 0) break;
+    await runPass(
+      alt,
+      (sub) => buildForcedTranslationPrompt(sourceLanguage, targetLanguage, targetLanguageName, sub)
+    );
+  }
+  if (pending.length > 0) {
+    console.warn(
+      `[Translate] ${pending.length}/${segments.length} segment(s) could not be verified in target language "${targetLanguage}"`
+    );
+  }
+  return lines;
 }
 function fetchGoogleTTSChunk(text, lang) {
   return new Promise((resolve, reject) => {
@@ -118,9 +254,50 @@ async function googleTTS(text, lang) {
 }
 app.get("/api/status", (_req, res) => {
   res.json({
-    groqConfigured: Boolean(process.env.GROQ_API_KEY?.trim()),
+    groqConfigured: Boolean(
+      process.env.GROQ_API_KEY?.trim() || process.env.GROQ_API_KEY2?.trim() || process.env.GROQ_API_KEY3?.trim()
+    ),
     geminiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim())
   });
+});
+app.get("/api/check-groq-keys", async (_req, res) => {
+  const results = [];
+  for (const envKey of envKeyOrder) {
+    const value = process.env[envKey]?.trim() || "";
+    if (!value) {
+      results.push({ envKey, configured: false, ok: false, error: "not configured" });
+      continue;
+    }
+    try {
+      const r = await fetch("https://api.groq.com/openai/v1/models", {
+        headers: { Authorization: `Bearer ${value}` },
+        signal: AbortSignal.timeout(2e4)
+      });
+      results.push({ envKey, configured: true, ok: r.ok, error: r.ok ? null : `HTTP ${r.status}` });
+    } catch (err) {
+      results.push({ envKey, configured: true, ok: false, error: `network: ${err?.name || "error"}` });
+    }
+  }
+  res.json({ keys: results, allOk: results.every((r) => r.ok) });
+});
+app.get("/api/list-groq-models", async (_req, res) => {
+  for (const envKey of envKeyOrder) {
+    const value = process.env[envKey]?.trim() || "";
+    if (!value) continue;
+    try {
+      const r = await fetch("https://api.groq.com/openai/v1/models", {
+        headers: { Authorization: `Bearer ${value}` },
+        signal: AbortSignal.timeout(2e4)
+      });
+      if (r.ok) {
+        const data = await r.json();
+        res.json({ models: (data?.data || []).map((m) => m.id).filter(Boolean) });
+        return;
+      }
+    } catch {
+    }
+  }
+  res.json({ models: [] });
 });
 app.post("/api/transcribe-and-translate", upload.single("file"), async (req, res) => {
   const apiKeys = getAllGroqKeys(req);
@@ -163,44 +340,14 @@ app.post("/api/transcribe-and-translate", upload.single("file"), async (req, res
     const fullOriginalText = segments.map((s) => s.originalText).join(" ");
     const duration = whisperData.duration || 0;
     const processingTimeMs = 0;
-    const langPair = `${detectedLanguage} \u2192 ${targetLanguage}`;
-    const prompt = `You are a professional subtitle translator. Translate each numbered segment below from ${langPair}. Keep the numbering and return ONLY the translated text lines, one per segment, preserving blank lines between segments.
-
-${segments.map((s, i) => `${i + 1}. ${s.originalText}`).join("\n")}`;
-    const modelsToTry = [translationModel, "openai/gpt-oss-120b", "openai/gpt-oss-20b"].filter((m, i, arr) => arr.indexOf(m) === i);
-    let chatData = null;
-    for (const model of modelsToTry) {
-      try {
-        const result = await fetchWithKeyFallback(
-          "https://api.groq.com/openai/v1/chat/completions",
-          apiKeys,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              model,
-              messages: [{ role: "user", content: prompt }],
-              temperature: 0.1,
-              max_tokens: 4096
-            })
-          }
-        );
-        if (result.res.ok) {
-          chatData = await result.res.json();
-          break;
-        } else {
-          await result.res.text().catch(() => "");
-          console.warn(`[Transcribe+Translate] Model ${model} returned ${result.res.status}`);
-        }
-      } catch (err) {
-        console.warn(`[Transcribe+Translate] Model ${model} failed:`, err?.message);
-        continue;
-      }
-    }
-    if (!chatData) {
-      throw new Error("Translation failed: all models are unavailable. Please check your API key.");
-    }
-    const translatedLines = (chatData.choices?.[0]?.message?.content || "").split("\n").map((l) => l.replace(/^\d+[\.\)]\s*/, "").trim()).filter((l) => l.length > 0);
+    const translatedLines = await translateSegmentsWithFallback(
+      apiKeys,
+      translationModel,
+      detectedLanguage,
+      targetLanguage,
+      targetLanguageName,
+      segments
+    );
     segments.forEach((seg, i) => {
       seg.translatedText = translatedLines[i] || seg.originalText;
     });
@@ -240,44 +387,14 @@ app.post("/api/translate-segments", import_express.default.json(), async (req, r
     return;
   }
   try {
-    const langPair = `${sourceLanguage} \u2192 ${targetLanguage}`;
-    const prompt = `You are a professional subtitle translator. Translate each numbered segment below from ${langPair}. Keep the numbering and return ONLY the translated text lines, one per segment, preserving blank lines between segments.
-
-${segments.map((s, i) => `${i + 1}. ${s.originalText}`).join("\n")}`;
-    const modelsToTry = [translationModel, "openai/gpt-oss-120b", "openai/gpt-oss-20b"].filter((m, i, arr) => arr.indexOf(m) === i);
-    let chatData = null;
-    for (const model of modelsToTry) {
-      try {
-        const result = await fetchWithKeyFallback(
-          "https://api.groq.com/openai/v1/chat/completions",
-          apiKeys,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              model,
-              messages: [{ role: "user", content: prompt }],
-              temperature: 0.1,
-              max_tokens: 4096
-            })
-          }
-        );
-        if (result.res.ok) {
-          chatData = await result.res.json();
-          break;
-        } else {
-          await result.res.text().catch(() => "");
-          console.warn(`[Translate] Model ${model} returned ${result.res.status}`);
-        }
-      } catch (err) {
-        console.warn(`[Translate] Model ${model} failed:`, err?.message);
-        continue;
-      }
-    }
-    if (!chatData) {
-      throw new Error("Translation failed: all models are unavailable");
-    }
-    const translatedLines = (chatData.choices?.[0]?.message?.content || "").split("\n").map((l) => l.replace(/^\d+[\.\)]\s*/, "").trim()).filter((l) => l.length > 0);
+    const translatedLines = await translateSegmentsWithFallback(
+      apiKeys,
+      translationModel,
+      sourceLanguage,
+      targetLanguage,
+      targetLanguageName,
+      segments
+    );
     segments.forEach((seg, i) => {
       seg.translatedText = translatedLines[i] || seg.originalText;
     });
@@ -307,21 +424,22 @@ app.post("/api/tts", import_express.default.json(), async (req, res) => {
     console.warn(`[TTS] Google TTS failed for language ${language}:`, err?.message || err);
   }
   const ttsKeys = getAllGroqKeys(req);
-  for (const key of ttsKeys) {
+  if (ttsKeys.length > 0) {
     try {
-      const ttsRes = await fetch("https://api.groq.com/openai/v1/audio/speech", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${key}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: "canopylabs/orpheus-v1-english",
-          input: text.trim(),
-          voice: "troy",
-          response_format: "wav"
-        })
-      });
+      const { res: ttsRes } = await fetchWithKeyFallback(
+        "https://api.groq.com/openai/v1/audio/speech",
+        ttsKeys,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "canopylabs/orpheus-v1-english",
+            input: text.trim(),
+            voice: "troy",
+            response_format: "wav"
+          })
+        }
+      );
       if (ttsRes.ok) {
         const audioBuffer = Buffer.from(await ttsRes.arrayBuffer());
         res.setHeader("Content-Type", "audio/wav");
@@ -357,30 +475,28 @@ app.post("/api/batch-tts", import_express.default.json(), async (req, res) => {
       console.warn(`[BatchTTS] Google TTS failed for seg ${seg.id}:`, err?.message);
     }
     if (!audioBase64 && ttsKeys.length > 0) {
-      for (const key of ttsKeys) {
-        try {
-          const ttsRes = await fetch("https://api.groq.com/openai/v1/audio/speech", {
+      try {
+        const { res: ttsRes } = await fetchWithKeyFallback(
+          "https://api.groq.com/openai/v1/audio/speech",
+          ttsKeys,
+          {
             method: "POST",
-            headers: {
-              Authorization: `Bearer ${key}`,
-              "Content-Type": "application/json"
-            },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               model: "canopylabs/orpheus-v1-english",
               input: seg.translatedText.trim(),
               voice: "troy",
               response_format: "wav"
             })
-          });
-          if (ttsRes.ok) {
-            const buf = Buffer.from(await ttsRes.arrayBuffer());
-            if (buf.length > 100) {
-              audioBase64 = buf.toString("base64");
-              break;
-            }
           }
-        } catch {
+        );
+        if (ttsRes.ok) {
+          const buf = Buffer.from(await ttsRes.arrayBuffer());
+          if (buf.length > 100) {
+            audioBase64 = buf.toString("base64");
+          }
         }
+      } catch {
       }
     }
     results.push({

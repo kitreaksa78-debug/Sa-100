@@ -1,4 +1,5 @@
 import { SubtitleSegment } from '../types';
+import { apiUrl } from './api';
 
 export function formatTimeCode(seconds: number): string {
   if (isNaN(seconds) || seconds < 0) return '00:00';
@@ -98,7 +99,7 @@ export async function speakText(
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
 
-    const res = await fetch('/api/tts', {
+    const res = await fetch(apiUrl('tts'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

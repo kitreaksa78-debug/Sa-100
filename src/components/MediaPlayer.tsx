@@ -1,4 +1,5 @@
 import React, { useRef, useState, useEffect, useImperativeHandle } from 'react';
+import { apiUrl } from '../utils/api';
 import {
   Play,
   Pause,
@@ -915,7 +916,7 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
           const formData = new FormData();
           formData.append('video', outBlob, 'recording.webm');
           onProgress?.(0.95);
-          const resp = await fetch('/api/render-mp4', { method: 'POST', body: formData });
+          const resp = await fetch(apiUrl('render-mp4'), { method: 'POST', body: formData });
           if (resp.ok) {
             const ct = resp.headers.get('content-type') || '';
             if (ct.includes('video/mp4') || ct.includes('application/octet-stream')) {

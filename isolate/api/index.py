@@ -32,13 +32,30 @@ app = Flask(__name__)
 
 # ---------------------------------------------------------------- Groq keys
 
+# In-memory rotation order for environment Groq keys. When a key is exhausted
+# (rate limit / quota / server error) it is moved to the end of this list, so
+# subsequent requests start with the key that still works: key1 → key2 → key3.
+_ENV_KEY_ORDER = ["GROQ_API_KEY", "GROQ_API_KEY2", "GROQ_API_KEY3"]
+
+
+def _rotate_key_to_back(key):
+    """Move the env key that produced `key` to the back of the rotation."""
+    global _ENV_KEY_ORDER
+    if len(_ENV_KEY_ORDER) < 2:
+        return
+    for i, env_key in enumerate(_ENV_KEY_ORDER):
+        if (os.environ.get(env_key) or "").strip() == key:
+            _ENV_KEY_ORDER = _ENV_KEY_ORDER[:i] + _ENV_KEY_ORDER[i + 1 :] + [env_key]
+            return
+
+
 def get_groq_keys():
-    """Client header key first, then env keys in order (deduplicated)."""
+    """Client header key first, then env keys in rotation order (deduplicated)."""
     keys = []
     header_key = (request.headers.get("x-groq-api-key") or "").strip()
     if header_key:
         keys.append(header_key)
-    for env_key in ("GROQ_API_KEY", "GROQ_API_KEY2", "GROQ_API_KEY3"):
+    for env_key in _ENV_KEY_ORDER:
         value = (os.environ.get(env_key) or "").strip()
         if value and value not in keys:
             keys.append(value)
@@ -49,7 +66,8 @@ def groq_post(url, keys, *, data=None, files=None, json_body=None, timeout=120):
     """POST to Groq with key fallback. Returns requests.Response.
 
     Retries the next key on 429/5xx/404/403; other client errors (401, 400…)
-    are returned as-is. Raises when every key fails with a retryable error.
+    are returned as-is. Exhausted keys rotate to the back so the next request
+    starts with the key that still works. Raises when every key fails.
     """
     last_err = None
     for key in keys:
@@ -64,12 +82,14 @@ def groq_post(url, keys, *, data=None, files=None, json_body=None, timeout=120):
             )
         except requests.RequestException as err:
             last_err = err
+            _rotate_key_to_back(key)
             continue
         if resp.ok:
             return resp
         err_body = (resp.text or "")[:200]  # consume body to avoid leaks
         if resp.status_code == 429 or resp.status_code >= 500 or resp.status_code in (404, 403):
             last_err = RuntimeError("HTTP %s with key ...%s: %s" % (resp.status_code, key[-6:], err_body))
+            _rotate_key_to_back(key)
             continue
         return resp
     raise last_err or RuntimeError("All API keys failed")
@@ -100,15 +120,22 @@ def translate_via_groq(keys, model, prompt):
     return None
 
 
-def build_translation_prompt(source_language, target_language, segments):
+def build_translation_prompt(source_language, target_language, target_language_name, segments):
     numbered = "\n".join(
         "%d. %s" % (i + 1, seg.get("originalText", "")) for i, seg in enumerate(segments)
     )
+    full_text = " ".join(
+        (seg.get("originalText") or "").strip() for seg in segments if (seg.get("originalText") or "").strip()
+    )
     return (
         "You are a professional subtitle translator. Translate each numbered segment "
-        "below from %s → %s. Keep the numbering and return ONLY the translated text "
-        "lines, one per segment, preserving blank lines between segments.\n\n%s"
-        % (source_language, target_language, numbered)
+        "below from %s → %s (%s). Every translated line MUST be written in the target "
+        "language (%s) script — never repeat the source-language text. Use the full "
+        "transcript below as context so short or ambiguous segments are translated "
+        "naturally and consistently. Keep the numbering and return ONLY the translated "
+        "text lines, one per segment, preserving blank lines between segments.\n\n"
+        'Full transcript: "%s"\n\n%s'
+        % (source_language, target_language, target_language_name or target_language, target_language, full_text, numbered)
     )
 
 
@@ -119,6 +146,66 @@ def parse_translated_lines(chat_data):
         content = ""
     lines = [_LEADING_NUMBER.sub("", line).strip() for line in content.split("\n")]
     return [line for line in lines if line]
+
+
+DEFAULT_TRANSLATION_MODEL = "openai/gpt-oss-120b"
+
+# Scripts that prove a line is written in the target language. Latin-script
+# targets (en, vi, …) cannot be verified this way and always pass.
+_TARGET_SCRIPT = {
+    "km": re.compile(r"[\u1780-\u17FF]"),
+    "zh": re.compile(r"[\u4E00-\u9FFF]"),
+    "ja": re.compile(r"[\u3040-\u30FF\u4E00-\u9FFF]"),
+    "ko": re.compile(r"[\uAC00-\uD7AF]"),
+    "th": re.compile(r"[\u0E00-\u0E7F]"),
+    "ru": re.compile(r"[\u0400-\u04FF]"),
+    "ar": re.compile(r"[\u0600-\u06FF]"),
+    "hi": re.compile(r"[\u0900-\u097F]"),
+}
+
+
+def line_in_target_script(line, target_language):
+    regex = _TARGET_SCRIPT.get(target_language)
+    if regex is None:
+        return True
+    return bool(regex.search(line))
+
+
+def build_forced_prompt(source_language, target_language, target_language_name, segments):
+    numbered = "\n".join(
+        "%d. %s" % (i + 1, seg.get("originalText", "")) for i, seg in enumerate(segments)
+    )
+    return (
+        "Translate the following subtitle segments from %s to %s (%s). Every line "
+        "MUST be written in the target language's script — never repeat the "
+        "original-language text. Return one translation per line, numbered to "
+        "match the input, with no extra text.\n\n%s"
+        % (source_language, target_language, target_language_name or target_language, numbered)
+    )
+
+
+def translate_segments_with_fallback(keys, model, source_language, target_language, target_language_name, segments):
+    """Translate every segment, then re-translate any line that came back in the
+    source language (echoed/empty) using the default model with a strict
+    instruction — so the output is always written in the target language's script.
+    """
+    prompt = build_translation_prompt(source_language, target_language, target_language_name, segments)
+    chat = translate_via_groq(keys, model, prompt)
+    lines = parse_translated_lines(chat) if chat else []
+    failing = [
+        i
+        for i, seg in enumerate(segments)
+        if i >= len(lines) or not line_in_target_script(lines[i], target_language)
+    ]
+    if failing:
+        sub = [segments[i] for i in failing]
+        sub_prompt = build_forced_prompt(source_language, target_language, target_language_name, sub)
+        sub_chat = translate_via_groq(keys, DEFAULT_TRANSLATION_MODEL, sub_prompt)
+        sub_lines = parse_translated_lines(sub_chat) if sub_chat else []
+        for j, idx in enumerate(failing):
+            if j < len(sub_lines) and line_in_target_script(sub_lines[j], target_language):
+                lines[idx] = sub_lines[j]
+    return lines
 
 
 # ------------------------------------------------- Google Translate TTS
@@ -233,7 +320,11 @@ def build_vtt(segments, use_translation):
 def handle_status():
     return jsonify(
         {
-            "groqConfigured": bool((os.environ.get("GROQ_API_KEY") or "").strip()),
+            "groqConfigured": bool(
+                (os.environ.get("GROQ_API_KEY") or "").strip()
+                or (os.environ.get("GROQ_API_KEY2") or "").strip()
+                or (os.environ.get("GROQ_API_KEY3") or "").strip()
+            ),
             "geminiConfigured": bool((os.environ.get("GEMINI_API_KEY") or "").strip()),
         }
     )
@@ -306,20 +397,11 @@ def handle_transcribe_and_translate():
         full_original_text = " ".join(seg["originalText"] for seg in segments)
         duration = whisper_data.get("duration") or 0
 
-        # Step 2: Translate segments with a Groq chat model
-        prompt = build_translation_prompt(detected_language, target_language, segments)
-        chat_data = translate_via_groq(api_keys, translation_model, prompt)
-        if not chat_data:
-            return (
-                jsonify(
-                    {
-                        "error": "Translation failed: all models are unavailable. Please check your API key."
-                    }
-                ),
-                500,
-            )
-
-        translated_lines = parse_translated_lines(chat_data)
+        # Step 2: Translate segments with a Groq chat model (with automatic
+        # verification that the output is written in the target language).
+        translated_lines = translate_segments_with_fallback(
+            api_keys, translation_model, detected_language, target_language, target_language_name, segments
+        )
         for i, seg in enumerate(segments):
             seg["translatedText"] = (
                 translated_lines[i] if i < len(translated_lines) else seg["originalText"]
@@ -361,12 +443,9 @@ def handle_translate_segments():
     translation_model = body.get("translationModel", "openai/gpt-oss-120b")
 
     try:
-        prompt = build_translation_prompt(source_language, target_language, segments)
-        chat_data = translate_via_groq(api_keys, translation_model, prompt)
-        if not chat_data:
-            return jsonify({"error": "Translation failed: all models are unavailable"}), 500
-
-        translated_lines = parse_translated_lines(chat_data)
+        translated_lines = translate_segments_with_fallback(
+            api_keys, translation_model, source_language, target_language, target_language_name, segments
+        )
         for i, seg in enumerate(segments):
             seg["translatedText"] = (
                 translated_lines[i] if i < len(translated_lines) else seg.get("originalText", "")
@@ -449,6 +528,67 @@ def handle_batch_tts():
     return jsonify({"audio": results, "fallback": False})
 
 
+def handle_check_groq_keys():
+    """Probe each configured environment Groq key (rotation order) and report
+    health. Never echoes key values — only per-key status.
+    """
+    results = []
+    for env_key in _ENV_KEY_ORDER:
+        value = (os.environ.get(env_key) or "").strip()
+        if not value:
+            results.append(
+                {"envKey": env_key, "configured": False, "ok": False, "error": "not configured"}
+            )
+            continue
+        try:
+            resp = requests.get(
+                "%s/models" % GROQ_BASE,
+                headers={"Authorization": "Bearer %s" % value},
+                timeout=20,
+            )
+        except requests.RequestException as err:
+            results.append(
+                {
+                    "envKey": env_key,
+                    "configured": True,
+                    "ok": False,
+                    "error": "network: %s" % type(err).__name__,
+                }
+            )
+            continue
+        results.append(
+            {
+                "envKey": env_key,
+                "configured": True,
+                "ok": resp.ok,
+                "error": None if resp.ok else "HTTP %s" % resp.status_code,
+            }
+        )
+    return jsonify({"keys": results, "allOk": all(r["ok"] for r in results)})
+
+
+def handle_list_groq_models():
+    """List model ids available on Groq (first configured key that answers).
+    Never echoes key values. Used to verify model ids before exposing them.
+    """
+    for env_key in _ENV_KEY_ORDER:
+        value = (os.environ.get(env_key) or "").strip()
+        if not value:
+            continue
+        try:
+            resp = requests.get(
+                "%s/models" % GROQ_BASE,
+                headers={"Authorization": "Bearer %s" % value},
+                timeout=20,
+            )
+        except requests.RequestException:
+            continue
+        if resp.ok:
+            data = resp.json() or {}
+            return jsonify({"models": [m.get("id") for m in data.get("data") or [] if m.get("id")]})
+    return jsonify({"models": []})
+
+
 def handle_verify_groq_key():
     body = request.get_json(silent=True) or {}
     api_key = (body.get("apiKey") or "").strip()
@@ -489,17 +629,22 @@ def handle_render_mp4():
 def _endpoint_name():
     """Best-effort resolution of the original endpoint name.
 
-    Supports per-path routing (e.g. /api/status) plus common proxy headers
-    and query overrides in case the platform rewrites the path to "/".
+    Resolution order:
+      1. ?route= / ?path= query param — used by the static deploy where the
+         function is mounted at /api/index.py and the client calls
+         /api/index.py?route=<endpoint>.
+      2. Proxy headers (x-original-url, …) — in case the platform rewrites
+         /api/<name> to the function and preserves the original URL there.
+      3. The last path segment (e.g. /api/status -> status).
     """
-    path = request.path or ""
+    route = (request.args.get("route") or request.args.get("path") or "").strip().strip("/")
+    if route:
+        return route.lower()
     for header in ("x-original-url", "x-forwarded-uri", "x-rewritten-url", "x-original-uri"):
         value = request.headers.get(header)
         if value:
-            path = value
-            break
-    if path in ("", "/"):
-        path = request.args.get("route") or request.args.get("path") or ""
+            return value.rstrip("/").rsplit("/", 1)[-1].lower()
+    path = request.path or ""
     name = path.rstrip("/").rsplit("/", 1)[-1].lower() if path else ""
     return name
 
@@ -511,6 +656,8 @@ _HANDLERS = {
     "tts": handle_tts,
     "batch-tts": handle_batch_tts,
     "verify-groq-key": handle_verify_groq_key,
+    "check-groq-keys": handle_check_groq_keys,
+    "list-groq-models": handle_list_groq_models,
     "render-mp4": handle_render_mp4,
 }
 
@@ -531,7 +678,7 @@ def dispatch(_path):
             ),
             404,
         )
-    if name == "status":
+    if name in ("status", "check-groq-keys", "list-groq-models"):
         if request.method != "GET":
             return jsonify({"error": "Method not allowed"}), 405
     elif request.method != "POST":

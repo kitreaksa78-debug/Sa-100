@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { KeyRound, Check, AlertCircle, X, ExternalLink, ShieldCheck, RefreshCw } from 'lucide-react';
 import { UILang, UI_TEXT } from '../data/translations';
+import { apiUrl } from '../utils/api';
 
 interface ApiKeyModalProps {
   isOpen: boolean;
@@ -30,7 +31,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({
     setTesting(true);
     setTestResult(null);
     try {
-      const res = await fetch('/api/verify-groq-key', {
+      const res = await fetch(apiUrl('verify-groq-key'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ apiKey: inputKey.trim() }),

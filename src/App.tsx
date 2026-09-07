@@ -22,6 +22,15 @@ import { UILang, UI_TEXT } from './data/translations';
 import { SubtitleSegment, TranscriptionResult, ServerStatus } from './types';
 import { LANGUAGES, SampleMedia } from './data/languages';
 import { exportToSrt, exportToVtt } from './utils/subtitleUtils';
+import { apiUrl } from './utils/api';
+import { shrinkMediaToAudio } from './utils/mediaCompress';
+import { recordUsage } from './utils/usageTracker';
+
+// The deployed site runs the API as a serverless function that rejects request
+// bodies over ~4.5 MB (HTTP 413). Anything above this guardrail must be shrunk
+// to audio in the browser before upload, or rejected with a clear message when
+// in-browser compression is unavailable on the client.
+const SERVERLESS_BODY_SAFE_BYTES = 4.2 * 1024 * 1024;
 
 export default function App() {
   // UI Language: Khmer by default per prompt
@@ -102,7 +111,7 @@ export default function App() {
 
   // Fetch server status on mount
   useEffect(() => {
-    fetch('/api/status')
+    fetch(apiUrl('status'))
       .then(async (res) => {
         const contentType = res.headers.get('content-type') || '';
         if (!contentType.includes('application/json')) return null;
@@ -209,6 +218,41 @@ export default function App() {
         throw new Error('Please upload an audio or video file from your device, or record your voice.');
       }
 
+      // The hosted serverless API rejects request bodies over ~4.5 MB, so media
+      // larger than a few MB is shrunk to a compact audio track (Whisper only
+      // needs audio). The encoder auto-adjusts the bitrate — with a second,
+      // lower-quality pass if needed — so files up to ~50 MB always fit.
+      // Compression runs in real time, so a live percentage is shown.
+      const MAX_RAW_UPLOAD_BYTES = 3.5 * 1024 * 1024;
+      if (fileToUpload.size > MAX_RAW_UPLOAD_BYTES) {
+        setProcessingStep(t.compressingMedia);
+        const shrunk = await shrinkMediaToAudio(fileToUpload, (fraction) => {
+          const pct = Math.min(99, Math.round(fraction * 100));
+          setProcessingStep(`${t.compressingMedia} (${pct}%)`);
+        });
+        if (shrunk && shrunk.blob.size > 2000) {
+          if (shrunk.silent) {
+            throw new Error(t.noSpeechDetected);
+          }
+          const baseName =
+            fileToUpload instanceof File && fileToUpload.name
+              ? fileToUpload.name.replace(/\.[^.]+$/, '')
+              : 'media';
+          const ext = /mp4|m4a|aac/i.test(shrunk.blob.type) ? 'm4a' : 'webm';
+          fileToUpload = new File([shrunk.blob], `${baseName}.${ext}`, {
+            type: shrunk.blob.type || 'audio/webm',
+          });
+        }
+      }
+
+      // Never send an oversized body to the deployed serverless API — the
+      // platform rejects it (413) before our backend runs. In dev/preview the
+      // Express backend accepts up to 50 MB raw, so only the deployed site
+      // needs this guard.
+      if (import.meta.env.PROD && fileToUpload.size > SERVERLESS_BODY_SAFE_BYTES) {
+        throw new Error(t.uploadTooLarge);
+      }
+
       const formData = new FormData();
       formData.append('file', fileToUpload);
       formData.append('whisperModel', whisperModel);
@@ -226,7 +270,7 @@ export default function App() {
 
       setProcessingStep(t.processingStep2);
 
-      const res = await fetch('/api/transcribe-and-translate', {
+      const res = await fetch(apiUrl('transcribe-and-translate'), {
         method: 'POST',
         headers,
         body: formData,
@@ -238,6 +282,9 @@ export default function App() {
         data = await res.json();
       } else {
         const text = await res.text();
+        if (res.status === 413) {
+          throw new Error(t.uploadTooLarge);
+        }
         throw new Error(
           `Backend server returned an error (Status ${res.status}): ${text ? text.slice(0, 120) : 'Non-JSON response'}`
         );
@@ -252,6 +299,9 @@ export default function App() {
 
       setResult(data);
       setCurrentTime(0);
+      // Track today's free-quota usage (per model) on this browser.
+      recordUsage(whisperModel);
+      recordUsage(translationModel);
     } catch (err: any) {
       console.error('Transcription error:', err);
       setErrorMessage(err.message || 'An error occurred during transcription.');
@@ -279,7 +329,7 @@ export default function App() {
         headers['x-groq-api-key'] = groqKey.trim();
       }
 
-      const res = await fetch('/api/translate-segments', {
+      const res = await fetch(apiUrl('translate-segments'), {
         method: 'POST',
         headers,
         body: JSON.stringify({
@@ -305,6 +355,7 @@ export default function App() {
       }
 
       setTargetLang(newTargetLang);
+      recordUsage(translationModel);
       setResult((prev) => {
         if (!prev) return null;
         return {
@@ -362,7 +413,7 @@ export default function App() {
 
       for (let i = 0; i < allSegments.length; i += BATCH_SIZE) {
         const batch = allSegments.slice(i, i + BATCH_SIZE);
-        const res = await fetch('/api/batch-tts', {
+        const res = await fetch(apiUrl('batch-tts'), {
           method: 'POST',
           headers,
           body: JSON.stringify({
