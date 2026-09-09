@@ -67,6 +67,24 @@ export const TRANSLATION_MODELS: AIModelInfo[] = [
     rpdPerKey: 250,
     rpdThreeKeys: 750,
   },
+  {
+    id: 'openai/gpt-oss-safeguard-20b',
+    label: 'GPT-OSS Safeguard 20B',
+    rpdPerKey: 1000,
+    rpdThreeKeys: 3000,
+  },
+  {
+    id: 'gemini/gemini-3.8-flash',
+    label: 'Gemini 3.8 Flash (Google)',
+    rpdPerKey: 1500,
+    rpdThreeKeys: 4500,
+  },
+  {
+    id: 'gemini/gemini-3.6-flash',
+    label: 'Gemini 3.6 Flash (Google)',
+    rpdPerKey: 1500,
+    rpdThreeKeys: 4500,
+  },
 ];
 
 export function findModel(models: AIModelInfo[], id: string): AIModelInfo | undefined {

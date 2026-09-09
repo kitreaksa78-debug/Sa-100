@@ -1,15 +1,20 @@
 import React from 'react';
-import { Sparkles } from 'lucide-react';
+import { Sparkles, LogOut } from 'lucide-react';
 import { UILang, UI_TEXT } from '../data/translations';
+import { GoogleUser } from '../utils/googleAuth';
 
 interface HeaderProps {
   uiLang: UILang;
   setUiLang: (lang: UILang) => void;
+  user?: GoogleUser | null;
+  onSignOut?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   uiLang,
   setUiLang,
+  user,
+  onSignOut,
 }) => {
   const t = UI_TEXT[uiLang];
 
@@ -38,6 +43,42 @@ export const Header: React.FC<HeaderProps> = ({
 
         {/* Right Controls */}
         <div className="flex items-center gap-2 sm:gap-3">
+          {/* Signed-in user chip — always visible (mobile & desktop) so the
+              logged-in account is never hidden, like a profile sidebar. */}
+          {user && (
+            <div className="flex items-center gap-1.5 sm:gap-2 pl-1 pr-1 sm:pl-1.5 sm:pr-2 py-1 rounded-full border border-stone-200 bg-stone-50">
+              {user.picture ? (
+                <img
+                  src={user.picture}
+                  alt={user.name}
+                  className="w-6 h-6 sm:w-7 sm:h-7 rounded-full object-cover ring-1 ring-orange-200 shrink-0"
+                  referrerPolicy="no-referrer"
+                />
+              ) : (
+                <span className="w-6 h-6 sm:w-7 sm:h-7 rounded-full bg-gradient-to-br from-orange-500 to-amber-500 text-white text-[10px] font-bold flex items-center justify-center shrink-0">
+                  {(user.name || user.email || '?').charAt(0).toUpperCase()}
+                </span>
+              )}
+              <div className="leading-tight max-w-[6.5rem] sm:max-w-[10rem] truncate">
+                <div className="text-[9px] sm:text-[10px] text-stone-400 font-medium truncate">
+                  {t.signedInAs}
+                </div>
+                <div className="text-[11px] sm:text-xs font-semibold text-stone-800 truncate">
+                  {user.name || user.email}
+                </div>
+              </div>
+              <button
+                id="header-sign-out-btn"
+                type="button"
+                onClick={onSignOut}
+                title={t.signOut}
+                className="ml-0.5 inline-flex items-center gap-1 px-1.5 sm:px-2 py-1.5 rounded-full text-[11px] font-semibold text-stone-500 hover:text-rose-600 hover:bg-rose-50 transition-colors shrink-0"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">{t.signOut}</span>
+              </button>
+            </div>
+          )}
           {/* Language Switcher Toggle */}
           <div className="flex items-center border border-stone-200 rounded-lg p-0.5 bg-stone-50">
             <button

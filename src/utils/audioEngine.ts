@@ -43,25 +43,17 @@ function teardownVocal(source: MediaElementAudioSourceNode, ctx: AudioContext) {
 }
 
 /**
- * Enable/disable center-channel vocal cancellation.
- * Returns the resulting enabled state.
+ * Build the classic karaoke center-cancel network: L−R on the left output and
+ * R−L on the right. Center-panned vocals cancel out; wide-panned music stays.
+ * Returns the list of created nodes (the last one is the network's output).
  */
-export function setVocalRemoval(el: HTMLMediaElement, enabled: boolean): boolean {
-  const g = ensureGraph(el);
-  const { ctx, source } = g;
-
-  teardownVocal(source, ctx);
-  if (!enabled) return false;
-
+function createCenterCancelNetwork(ctx: AudioContext): AudioNode[] {
   const splitter = ctx.createChannelSplitter(2);
   const merger = ctx.createChannelMerger(2);
   const gL = ctx.createGain();
   const gR = ctx.createGain();
   const invR = ctx.createGain(); invR.gain.value = -1;
   const invL = ctx.createGain(); invL.gain.value = -1;
-
-  source.disconnect();
-  source.connect(splitter);
 
   // L_out = L - R   (cancels center-panned vocals)
   splitter.connect(gL, 0);
@@ -75,9 +67,29 @@ export function setVocalRemoval(el: HTMLMediaElement, enabled: boolean): boolean
   gR.connect(merger, 0, 1);
   invL.connect(merger, 0, 1);
 
+  return [splitter, merger, gL, gR, invL, invR];
+}
+
+/**
+ * Enable/disable center-channel vocal cancellation.
+ * Returns the resulting enabled state.
+ */
+export function setVocalRemoval(el: HTMLMediaElement, enabled: boolean): boolean {
+  const g = ensureGraph(el);
+  const { ctx, source } = g;
+
+  teardownVocal(source, ctx);
+  if (!enabled) return false;
+
+  const nodes = createCenterCancelNetwork(ctx);
+  const merger = nodes[1]; // [splitter, merger, ...]
+  const splitter = nodes[0];
+
+  source.disconnect();
+  source.connect(splitter);
   merger.connect(ctx.destination);
 
-  vocalNodes = { nodes: [splitter, merger, gL, gR, invL, invR] };
+  vocalNodes = { nodes };
   return true;
 }
 
@@ -99,7 +111,8 @@ export type ExportPath = {
 export function buildExportPath(
   el: HTMLMediaElement,
   bgVolume: number,
-  voiceVolume: number
+  voiceVolume: number,
+  removeVocals = false
 ): ExportPath {
   const g = ensureGraph(el);
   const { ctx, source } = g;
@@ -113,7 +126,18 @@ export function buildExportPath(
   voiceGain.gain.value = voiceVolume;
   const mixDest = ctx.createMediaStreamDestination();
 
-  source.connect(bgGain);
+  if (removeVocals) {
+    // Original voice removed (center-cancel) → only the music/ambience reaches
+    // the background bus, then the translated AI voice is mixed on top.
+    const nodes = createCenterCancelNetwork(ctx);
+    const splitter = nodes[0];
+    const merger = nodes[1];
+    source.connect(splitter);
+    merger.connect(bgGain);
+  } else {
+    source.connect(bgGain);
+  }
+
   bgGain.connect(ctx.destination); // user hears while exporting
   bgGain.connect(mixDest);         // recorded
   voiceGain.connect(ctx.destination);

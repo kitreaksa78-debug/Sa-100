@@ -18,17 +18,20 @@ interface OptionsBarProps {
   onTranscribeAndTranslate: () => void;
   isProcessing: boolean;
   canProcess: boolean;
+  userId?: string;
 }
 
 function ModelQuotaHint({
   t,
   model,
+  userId,
 }: {
   t: (typeof UI_TEXT)['km'];
   model?: { id: string; rpdPerKey: number; rpdThreeKeys: number };
+  userId?: string;
 }) {
   if (!model) return null;
-  const used = getUsage(model.id);
+  const used = getUsage(model.id, userId);
   const fmt = (template: string, vars: Record<string, string | number>) =>
     Object.entries(vars).reduce(
       (acc, [k, v]) => acc.replace(`{${k}}`, String(v)),
@@ -60,6 +63,7 @@ export const OptionsBar: React.FC<OptionsBarProps> = ({
   onTranscribeAndTranslate,
   isProcessing,
   canProcess,
+  userId,
 }) => {
   const t = UI_TEXT[uiLang];
 
@@ -131,6 +135,7 @@ export const OptionsBar: React.FC<OptionsBarProps> = ({
           <ModelQuotaHint
             t={t}
             model={findModel(WHISPER_MODELS, whisperModel)}
+            userId={userId}
           />
         </div>
 
@@ -156,6 +161,7 @@ export const OptionsBar: React.FC<OptionsBarProps> = ({
           <ModelQuotaHint
             t={t}
             model={findModel(TRANSLATION_MODELS, translationModel)}
+            userId={userId}
           />
         </div>
       </div>

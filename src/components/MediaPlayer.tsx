@@ -10,17 +10,23 @@ import {
   Subtitles,
   Music,
   Radio,
-  Sparkles,
-  MicOff,
+  Bot,
 } from 'lucide-react';
 import { SubtitleSegment } from '../types';
 import { formatClockTime, speakText, stopSpeaking } from '../utils/subtitleUtils';
-import { setVocalRemoval, buildExportPath, type ExportPath } from '../utils/audioEngine';
+import { buildExportPath, setVocalRemoval, type ExportPath } from '../utils/audioEngine';
+import { isSeparableBuffer } from '../utils/vocalSeparation';
+import { TalkingAvatar } from './TalkingAvatar';
 import { UILang, UI_TEXT } from '../data/translations';
 
 export interface MediaPlayerHandle {
   exportDubbed: (onProgress?: (p: number) => void) => Promise<{ blob: Blob; ext: string } | null>;
 }
+
+// Music level while the translated AI voice speaks, relative to the
+// background-music slider. The live preview and the exported file share this
+// exact value so the download sounds like what the user heard while playing.
+const MUSIC_DUCK = 0.45;
 
 // --- Canvas helpers: burn CC subtitles into the exported video frame ---
 
@@ -170,6 +176,8 @@ interface MediaPlayerProps {
   uiLang?: UILang;
   muteOriginal?: boolean;
   setMuteOriginal?: (mute: boolean) => void;
+  /** When true, exports strip the original voice and keep only music + AI voice. */
+  removeVocalsOnExport?: boolean;
 }
 
 export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>(function MediaPlayer({
@@ -183,6 +191,7 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
   uiLang = 'km',
   muteOriginal = false,
   setMuteOriginal,
+  removeVocalsOnExport = true,
 }, ref) {
   const t = UI_TEXT[uiLang];
   const [isPlaying, setIsPlaying] = useState(false);
@@ -427,12 +436,50 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
   };
   const [isAiVoiceDubbing, setIsAiVoiceDubbing] = useState(false);
   const [bgVolume, setBgVolume] = useState(0.15); // Background music volume during dubbing
+  const [avatarOn, setAvatarOn] = useState(false); // Talking avatar toggle
+  const [activeDubbedEl, setActiveDubbedEl] = useState<HTMLAudioElement | null>(null);
   const [voiceVolume, setVoiceVolume] = useState(1.0); // AI voice volume
-  const [isVocalRemoval, setIsVocalRemoval] = useState(false);
   const lastSpokenSegmentIdRef = useRef<number | null>(null);
   const dubbedAudioRef = useRef<HTMLAudioElement | null>(null);
   const currentTimeRef = useRef<number>(0); // Always-fresh playback time for accurate sync
   const exportBusyRef = useRef(false);
+  const isAiVoiceDubbingRef = useRef(false); // fresh flag for async vocal-removal checks
+  const separablePromiseRef = useRef<Promise<boolean> | null>(null);
+
+  // Can this clip's vocals be separated from the music (true stereo)? Decoded
+  // lazily once per media file and reused by both the live preview and export.
+  const getSeparable = (): Promise<boolean> => {
+    if (!separablePromiseRef.current) {
+      separablePromiseRef.current = (async () => {
+        try {
+          if (!mediaUrl) return false;
+          const res = await fetch(mediaUrl);
+          if (!res.ok) return false;
+          const ab = await res.arrayBuffer();
+          const AudioCtx: typeof AudioContext | undefined =
+            window.AudioContext || (window as any).webkitAudioContext;
+          if (!AudioCtx) return false;
+          const ctx = new AudioCtx();
+          try {
+            const buf = await ctx.decodeAudioData(ab);
+            return isSeparableBuffer(buf);
+          } finally {
+            setTimeout(() => {
+              try { ctx.close(); } catch { /* noop */ }
+            }, 2000);
+          }
+        } catch {
+          return false;
+        }
+      })();
+    }
+    return separablePromiseRef.current;
+  };
+
+  // A new media file means a fresh separability check.
+  useEffect(() => {
+    separablePromiseRef.current = null;
+  }, [mediaUrl]);
 
   // Find active segment for current playback timestamp
   const activeSegment = segments.find(
@@ -448,36 +495,45 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
   const displaySegment =
     activeSegment ?? (subtitlePreviewHold ? lastSegmentRef.current : null);
 
-  // Toggle vocal removal via shared audio engine
-  const toggleVocalRemoval = () => {
-    const el = mediaPlayerRef.current;
-    if (!el) return;
-    try {
-      const nowOn = setVocalRemoval(el, !isVocalRemoval);
-      setIsVocalRemoval(nowOn);
-    } catch (err) {
-      console.warn('Vocal removal toggle failed:', err);
-    }
-  };
-
-  // Smart audio mixing: duck background music when AI voice speaks
+  // Smart audio mixing: when AI dubbing is ON, remove the ORIGINAL speaker
+  // (center-cancel, stereo sources only) so only music + translated voice are
+  // heard — exactly what the exported file contains. Applied ONCE per dubbing
+  // session: rebuilding the network on every subtitle line change caused
+  // audible clicks/glitches mid-song. Mono/dual-mono clips (cannot be
+  // separated) fall back to plain ducking — never a broken mix.
   useEffect(() => {
+    isAiVoiceDubbingRef.current = isAiVoiceDubbing;
     const el = mediaPlayerRef.current;
     if (!el) return;
+    let cancelled = false;
 
-    if (isAiVoiceDubbing && isPlaying) {
-      // During AI dubbing: reduce original volume (ducking)
-      // When a segment is active, duck more; when gap, restore slightly
-      if (activeSegment && activeSegment.dubbedAudioBase64) {
-        el.volume = bgVolume * 0.3; // Very low during AI speech
-      } else {
-        el.volume = bgVolume; // Background music at low volume in gaps
-      }
-      el.muted = false; // Don't fully mute — keep background music
-    } else if (!isAiVoiceDubbing) {
+    if (isAiVoiceDubbing) {
+      getSeparable().then((separable) => {
+        if (cancelled || !separable) return;
+        const cur = mediaPlayerRef.current;
+        if (cur && isAiVoiceDubbingRef.current) setVocalRemoval(cur, true);
+      });
+    } else {
+      setVocalRemoval(el, false); // restore full original audio
       el.volume = 1.0; // Full volume when dubbing is off
     }
-  }, [isAiVoiceDubbing, isPlaying, activeSegment, bgVolume, mediaPlayerRef]);
+    return () => {
+      cancelled = true;
+    };
+  }, [isAiVoiceDubbing, mediaPlayerRef]);
+
+  // While dubbing, duck the music under the AI voice per segment (dip during
+  // speech, recover in gaps). Volume only — the user's mute is respected and
+  // never overridden by a segment change.
+  useEffect(() => {
+    if (!isAiVoiceDubbing || !isPlaying) return;
+    const el = mediaPlayerRef.current;
+    if (!el || isMuted) return;
+    el.volume =
+      activeSegment && activeSegment.dubbedAudioBase64
+        ? bgVolume * MUSIC_DUCK
+        : bgVolume;
+  }, [isAiVoiceDubbing, isPlaying, activeSegment, bgVolume, isMuted, mediaPlayerRef]);
 
   // Play pre-generated dubbed audio segment with precise timing sync
   // Rate is calculated from REMAINING segment time so speech fits the video exactly
@@ -501,6 +557,8 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
     audio.volume = voiceVolume; // Apply user-set AI voice volume
     audio.preservesPitch = true; // Keep natural pitch when speeding up/slowing down
     dubbedAudioRef.current = audio;
+    // Feed the avatar lip-sync analyser (fresh element per segment).
+    setActiveDubbedEl(audio);
 
     audio.onloadedmetadata = () => {
       const audioDuration = audio.duration;
@@ -523,18 +581,21 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
       }
     };
 
-    audio.onended = () => {
-      URL.revokeObjectURL(audioUrl);
+    const clearActiveAudio = () => {
       if (dubbedAudioRef.current === audio) {
         dubbedAudioRef.current = null;
       }
+      setActiveDubbedEl((prev) => (prev === audio ? null : prev));
+    };
+
+    audio.onended = () => {
+      URL.revokeObjectURL(audioUrl);
+      clearActiveAudio();
     };
 
     audio.onerror = () => {
       URL.revokeObjectURL(audioUrl);
-      if (dubbedAudioRef.current === audio) {
-        dubbedAudioRef.current = null;
-      }
+      clearActiveAudio();
     };
 
     audio.play().catch(() => {});
@@ -550,6 +611,7 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
           dubbedAudioRef.current.pause();
           dubbedAudioRef.current = null;
         }
+        setActiveDubbedEl(null);
       }
       return;
     }
@@ -741,64 +803,113 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
 
     let handle: ExportPath | null = null;
     let exportRafId = 0;
+    let exportDrawTimer = 0;
+    // Hoisted outside the try so the finally block can clean it up (let
+    // declarations inside a try are not visible in its finally).
+    let canvas: HTMLCanvasElement | null = null;
     try {
-      handle = buildExportPath(el, bgVolume, voiceVolume);
+      // Smart export: when the user enabled "remove original voice", strip the
+      // speaker (center-cancel) from the recorded background so the final file
+      // is video + music + translated voice. Mono/dual-mono clips cannot be
+      // separated → plain ducking fallback (never a broken/empty file).
+      const useVocalRemoval = removeVocalsOnExport === true && (await getSeparable());
+      handle = buildExportPath(el, bgVolume, voiceVolume, useVocalRemoval);
       const { ctx, mixDest, bgGain, voiceGain, restore } = handle;
 
-      // Pick the best supported container — MP4 only, no WebM fallback
-      const mp4Candidates = isVideo
+      // Pick the best supported container that will actually PLAY on phones:
+      // 1) True H.264+AAC MP4 (iPhone Safari records this natively) — plays
+      //    in the phone gallery everywhere.
+      // 2) VP8+Opus WebM — plays in Android galleries and most players. We
+      //    prefer this over a generic "video/mp4" whose codecs may be VP9
+      //    (many phone galleries reject VP9-in-MP4).
+      // 3) Generic WebM / generic MP4 as last resorts.
+      const mimeCandidates = isVideo
         ? [
             'video/mp4;codecs="avc1.42E01E,mp4a.40.2"',
+            'video/webm;codecs=vp8,opus',
+            'video/webm',
             'video/mp4',
           ]
-        : ['audio/mp4'];
+        : ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'];
       const mimeType =
-        mp4Candidates.find((m) => {
+        mimeCandidates.find((m) => {
           try { return MediaRecorder.isTypeSupported(m); } catch { return false; }
         });
       if (!mimeType) {
-        throw new Error('Your browser does not support MP4 recording. Please use Chrome or Edge for MP4 export.');
+        throw new Error('Your browser does not support media recording. Please use Chrome, Edge or Safari.');
       }
 
-      // Video track: when CC is ON, burn subtitles onto a canvas stream so the
-      // downloaded video INCLUDES them. When CC is OFF, capture the raw video
-      // (no subtitles). Audio always comes from the Web Audio mix.
+      // Video track: ALWAYS render through a canvas (rAF draw loop) and capture
+      // the canvas stream. This is far more reliable on Android, where
+      // element.captureStream() can silently produce ZERO frames — the result is
+      // exactly the broken "0.00 MB · 0:00 / 0:00" file seen in the field — when
+      // the element is offscreen, throttled, or being composited oddly. Subtitles
+      // are burned into the same canvas when CC is ON; when CC is OFF we still
+      // draw the plain video frame. Element capture is only a fallback for
+      // browsers without canvas.captureStream (older iOS Safari).
       const burnSubs =
         isVideo && showSubtitles && subtitleOpacity > 0 && subtitleScale > 0;
-      let canvas: HTMLCanvasElement | null = null;
       let ctx2d: CanvasRenderingContext2D | null = null;
+      let videoTrackSource: 'canvas' | 'element' | 'none' = 'none';
       const vEl = el as HTMLVideoElement;
       const tracks: MediaStreamTrack[] = [];
       if (isVideo) {
         try {
-          let vs: MediaStream | null = null;
-          if (burnSubs) {
-            canvas = document.createElement('canvas');
-            canvas.width = vEl.videoWidth || 1280;
-            canvas.height = vEl.videoHeight || 720;
-            ctx2d = canvas.getContext('2d');
-            const cs = canvas && (canvas as any).captureStream;
-            if (ctx2d && cs) {
-              vs = (canvas as any).captureStream(30);
-            } else {
-              canvas = null;
-              ctx2d = null;
+          canvas = document.createElement('canvas');
+          canvas.width = vEl.videoWidth || 1280;
+          canvas.height = vEl.videoHeight || 720;
+          // CRITICAL for Android: canvas.captureStream() only emits frames while
+          // the canvas is actually PAINTED by the compositor. A detached canvas
+          // silently produces ZERO frames on Android Chrome → the "0.00 MB" /
+          // "empty recording" bug. Attach it to the DOM, tiny and near-invisible
+          // (opacity > 0 so it still paints), with pointer-events disabled.
+          canvas.style.cssText =
+            'position:fixed;top:0;left:0;width:2px;height:2px;opacity:0.02;' +
+            'pointer-events:none;z-index:2147483647;will-change:transform;' +
+            'transform:translateZ(0);';
+          canvas.setAttribute('aria-hidden', 'true');
+          document.body.appendChild(canvas);
+          ctx2d = canvas.getContext('2d');
+          const cs = canvas && (canvas as any).captureStream;
+          if (ctx2d && cs) {
+            const vs: MediaStream = (canvas as any).captureStream(30);
+            const vt = vs.getVideoTracks?.()[0];
+            if (vt) {
+              tracks.push(vt);
+              videoTrackSource = 'canvas';
             }
           }
-          if (!vs) {
-            vs = (vEl as any).captureStream
+          if (videoTrackSource === 'none') {
+            canvas.remove();
+            canvas = null;
+            ctx2d = null;
+          }
+        } catch {
+          try { canvas?.remove(); } catch { /* noop */ }
+          canvas = null;
+          ctx2d = null;
+        }
+        if (videoTrackSource === 'none') {
+          try {
+            const vs: MediaStream | undefined = (vEl as any).captureStream
               ? (vEl as any).captureStream()
               : (vEl as any).mozCaptureStream
               ? (vEl as any).mozCaptureStream()
               : (vEl as any).webkitCaptureStream();
+            const vt = vs?.getVideoTracks?.()[0];
+            if (vt) {
+              tracks.push(vt);
+              videoTrackSource = 'element';
+            }
+          } catch {
+            // captureStream unavailable → audio-only export
           }
-          const vt = vs?.getVideoTracks?.()[0];
-          if (vt) tracks.push(vt);
-        } catch {
-          // captureStream unavailable → audio-only export
         }
       }
       tracks.push(...mixDest.stream.getAudioTracks());
+      if (tracks.length === 0) {
+        throw new Error(t.exportNoCapture);
+      }
       const stream = new MediaStream(tracks);
 
       const recorder = new MediaRecorder(stream, { mimeType });
@@ -821,16 +932,61 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
         } catch { /* skip undecodable segment */ }
       }
 
-      // Reset media, then play + record in real-time
+      // Reset media, then play + record in real-time. Two guards fix the
+      // Android "empty recording" bug: (1) the AudioContext MUST be running or
+      // the captured audio track stays silent/empty, and (2) play() can resolve
+      // before frames actually flow, so we wait for the real `playing` event.
+      if (ctx.state === 'suspended') {
+        try {
+          await ctx.resume();
+        } catch {
+          /* non-fatal */
+        }
+      }
       el.pause();
       el.muted = false;
       el.volume = 1;
       el.currentTime = 0;
-      await el.play();
+
+      // Start the recorder BEFORE the video plays so no audio/video sample at
+      // the very beginning gets dropped (both tracks begin at the same instant,
+      // which keeps voice ↔ video sync exact in the final file).
       recorder.start(500);
 
-      // Burn CC subtitles onto every frame while recording (only when CC is ON)
-      const drawLoop = () => {
+      // Sample BOTH clocks at the same wall moment (the `playing` event) so we
+      // can schedule the dubbed voice exactly on the video timeline instead of
+      // guessing an offset after playback already started.
+      let wallStart = 0;
+      let ctxAtStart = 0;
+      const markStart = () => {
+        wallStart = performance.now();
+        ctxAtStart = ctx.currentTime;
+      };
+      vEl.addEventListener('playing', markStart);
+
+      try {
+        await el.play();
+      } catch (err) {
+        // Autoplay/gesture rejection on Android — stop the recorder so we never
+        // hand back a silent empty file, then surface a clear error.
+        try { recorder.stop(); } catch { /* noop */ }
+        await stopped.catch(() => {});
+        throw new Error(t.exportEmptyRecording);
+      }
+      if (vEl.readyState < 2) {
+        await new Promise<void>((resolve) => {
+          const done = () => {
+            vEl.removeEventListener('playing', done);
+            resolve();
+          };
+          vEl.addEventListener('playing', done);
+          window.setTimeout(done, 2500);
+        });
+      }
+
+      // Draw one frame synchronously so the captured video track has data from
+      // the very first moment, then keep drawing via rAF while recording.
+      const drawFrame = () => {
         if (!ctx2d || !canvas) return;
         if (vEl.videoWidth > 0 && vEl.videoHeight > 0) {
           if (canvas.width !== vEl.videoWidth || canvas.height !== vEl.videoHeight) {
@@ -849,21 +1005,39 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
             });
           }
         }
+      };
+      const drawLoop = () => {
+        drawFrame();
         exportRafId = requestAnimationFrame(drawLoop);
       };
-      if (ctx2d) exportRafId = requestAnimationFrame(drawLoop);
+      if (ctx2d) {
+        drawFrame();
+        exportRafId = requestAnimationFrame(drawLoop);
+        // Interval fallback: rAF can be throttled/paused on some Android
+        // devices mid-recording, which would stall canvas frame emission.
+        exportDrawTimer = window.setInterval(drawFrame, 40);
+      }
 
-      const t0 = ctx.currentTime + 0.15;
+      // Audio time 0 is defined as the instant the video ACTUALLY started
+      // (wallStart / ctxAtStart were sampled together on `playing`). Scheduling
+      // at t0 + seg.start therefore plays each phrase exactly when its subtitle
+      // segment appears on screen. The +0.05 guard keeps every start() time in
+      // the future (sample-accurate) — total lip-sync error stays under ~50ms.
+      const elapsedSinceStart = wallStart ? (performance.now() - wallStart) / 1000 : 0;
+      const t0 = wallStart
+        ? ctxAtStart - elapsedSinceStart + 0.05
+        : ctx.currentTime + 0.15;
+      vEl.removeEventListener('playing', markStart);
       const mediaDuration = el.duration || 0;
 
       // Schedule every dubbed segment at its exact video timestamp.
       // playbackRate = audioDuration / segmentDuration  → time-stretch so the
-      // phrase ENDS precisely when its subtitle segment ends (clamped 0.85–1.8x).
+      // phrase ENDS precisely when its subtitle segment ends (clamped 0.85–2.0x).
       for (const seg of segments) {
         const buf = buffers.get(seg.id);
         if (!buf) continue;
         const segDur = Math.max(seg.end - seg.start, 0.4);
-        const rate = Math.min(Math.max(buf.duration / segDur, 0.85), 1.8);
+        const rate = Math.min(Math.max(buf.duration / segDur, 0.85), 2.0);
         const src = ctx.createBufferSource();
         src.buffer = buf;
         src.playbackRate.value = rate;
@@ -876,8 +1050,8 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
         const bg = bgGain.gain;
         try {
           bg.setValueAtTime(bgVolume, Math.max(sAt - 0.08, ctx.currentTime));
-          bg.linearRampToValueAtTime(bgVolume * 0.25, sAt + 0.06);
-          bg.setValueAtTime(bgVolume * 0.25, sEnd);
+          bg.linearRampToValueAtTime(bgVolume * MUSIC_DUCK, sAt + 0.06);
+          bg.setValueAtTime(bgVolume * MUSIC_DUCK, sEnd);
           bg.linearRampToValueAtTime(bgVolume, sEnd + 0.25);
         } catch { /* automation overlap — non-fatal */ }
       }
@@ -906,12 +1080,43 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
 
       const outBlob = new Blob(chunks, { type: mimeType.split(';')[0] });
 
-      // MP4 only — no WebM fallback. If the browser recorded MP4 natively, use it directly.
-      // If not MP4 (should not happen with the guard above), try server-side conversion.
-      const isAlreadyMp4 = mimeType.includes('mp4');
+      // Never hand back a broken/empty recording (phones render it as a
+      // playable-looking "0.00 MB · 0:00 / 0:00" file). If the capture produced
+      // no data, fail loudly with a clear message instead.
+      const minBytes = isVideo ? 15_000 : 2_000;
+      if (outBlob.size < minBytes) {
+        console.warn(`[Export] Recording too small (${outBlob.size}B) — capture produced no data.`);
+        throw new Error(t.exportEmptyRecording);
+      }
 
-      if (isVideo && outBlob.size > 1000 && !isAlreadyMp4) {
-        // Non-MP4 recording — attempt server-side FFmpeg conversion to MP4
+      // Name the file by its REAL container (sniff the magic bytes), never by
+      // assumption — a WebM blob named .mp4 is what makes phones reject it.
+      const sniffContainer = async (blob: Blob): Promise<'mp4' | 'webm' | 'unknown'> => {
+        try {
+          const buf = new Uint8Array(await blob.slice(0, 32).arrayBuffer());
+          // MP4 family starts with a size + "ftyp" at bytes 4..7
+          if (buf.length > 12 && buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) {
+            return 'mp4';
+          }
+          // WebM / Matroska starts with EBML magic 0x1A45DFA3
+          if (buf.length > 4 && buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) {
+            return 'webm';
+          }
+          return 'unknown';
+        } catch {
+          return 'unknown';
+        }
+      };
+      const container = await sniffContainer(outBlob);
+      const declaredMp4 = mimeType.includes('mp4');
+      let ext = isVideo ? 'mp4' : 'm4a';
+      if (container === 'webm') ext = 'webm';
+      else if (container === 'unknown') ext = isVideo ? (declaredMp4 ? 'mp4' : 'webm') : (declaredMp4 ? 'm4a' : 'webm');
+
+      // WebM recording + video: try server-side conversion to a real MP4.
+      // (The deployed serverless platform has no ffmpeg, so this usually
+      // returns 501 — in that case we simply deliver the WebM, correctly named.)
+      if (isVideo && ext === 'webm' && outBlob.size > 1000) {
         try {
           const formData = new FormData();
           formData.append('video', outBlob, 'recording.webm');
@@ -921,32 +1126,32 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
             const ct = resp.headers.get('content-type') || '';
             if (ct.includes('video/mp4') || ct.includes('application/octet-stream')) {
               const mp4Blob = await resp.blob();
-              if (mp4Blob.size > 1000) {
+              const mp4Container = await sniffContainer(mp4Blob);
+              if (mp4Blob.size > 1000 && mp4Container === 'mp4') {
                 console.log(`[Export] Server MP4 conversion: ${(mp4Blob.size / 1024 / 1024).toFixed(1)}MB`);
                 return { blob: mp4Blob, ext: 'mp4' };
               }
             }
           }
           await resp.text().catch(() => '');
-          throw new Error('Server-side MP4 conversion is unavailable. MP4 export requires Chrome or Edge browser.');
+          console.warn('[Export] Server MP4 conversion unavailable — keeping WebM.');
         } catch (err) {
-          throw new Error('MP4 conversion failed. Please use Chrome or Edge for direct MP4 recording.');
+          console.warn('[Export] MP4 conversion failed — keeping WebM:', (err as any)?.message);
         }
       }
 
-      if (isVideo && outBlob.size > 1000) {
-        console.log(`[Export] Native MP4 recording: ${(outBlob.size / 1024 / 1024).toFixed(1)}MB`);
+      if (outBlob.size > 1000) {
+        console.log(`[Export] Recorded ${container === 'unknown' ? mimeType : container}: ${(outBlob.size / 1024 / 1024).toFixed(1)}MB`);
       }
-
-      const ext = isVideo ? 'mp4' : 'm4a';
       return { blob: outBlob, ext };
     } catch (err) {
       console.error('Export failed:', err);
       throw err;
     } finally {
       if (exportRafId) cancelAnimationFrame(exportRafId);
+      if (exportDrawTimer) window.clearInterval(exportDrawTimer);
+      try { canvas?.remove(); } catch { /* noop */ }
       handle?.restore();
-      setIsVocalRemoval(false);
       el.pause();
       el.currentTime = 0;
       setCurrentTime(0);
@@ -994,8 +1199,20 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
             <div className="w-20 h-20 rounded-full bg-orange-600/30 border border-orange-500/50 flex items-center justify-center text-orange-400 mb-4 shadow-inner">
               <Music className="w-10 h-10 animate-pulse" />
             </div>
-            <p className="text-sm font-semibold text-stone-300">Audio Track Playing</p>
-            <p className="text-xs text-stone-500 mt-1">Live subtitles synchronized below</p>
+            <p className="text-sm font-semibold text-stone-300">{t.audioTrackPlaying}</p>
+            <p className="text-xs text-stone-500 mt-1">{t.liveSubtitlesBelow}</p>
+          </div>
+        )}
+
+        {/* Talking Avatar — lip-syncs with the dubbed voice (or pulses on active segments) */}
+        {avatarOn && (
+          <div className="absolute bottom-2 right-2 z-20">
+            <TalkingAvatar
+              enabled={avatarOn}
+              audioEl={activeDubbedEl}
+              speaking={Boolean(isAiVoiceDubbing && isPlaying && activeSegment)}
+              uiLang={uiLang}
+            />
           </div>
         )}
 
@@ -1122,21 +1339,22 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
               <span>AI Voice</span>
             </button>
 
-            {/* Vocal Removal Toggle (compact) */}
+            {/* Talking Avatar Toggle (compact) */}
             <button
-              id="player-toggle-vocal-removal"
+              id="player-toggle-avatar"
               type="button"
-              onClick={toggleVocalRemoval}
+              onClick={() => setAvatarOn((v) => !v)}
               className={`px-2 py-1 sm:px-2.5 sm:py-1.5 rounded-lg text-[11px] sm:text-xs font-semibold flex items-center gap-1 sm:gap-1.5 whitespace-nowrap shrink-0 transition-all ${
-                isVocalRemoval
-                  ? 'bg-purple-600 text-white shadow-sm ring-1 ring-purple-400'
+                avatarOn
+                  ? 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-sm ring-1 ring-emerald-400'
                   : 'text-stone-400 hover:text-white hover:bg-stone-800'
               }`}
-              title={isVocalRemoval ? 'Voice Removed (Music Only)' : 'Remove Voice (Keep Music)'}
+              title={t.avatarTooltip}
             >
-              <MicOff className="w-3.5 h-3.5 shrink-0" />
-              <span>{isVocalRemoval ? 'Music' : 'No Voice'}</span>
+              <Bot className={`w-3.5 h-3.5 shrink-0 ${avatarOn ? 'text-emerald-200' : ''}`} />
+              <span>{t.avatarLabel}</span>
             </button>
+
           </div>
 
           {/* Subtitle Controls */}
@@ -1196,50 +1414,6 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
               </div>
             )}
 
-            {/* Subtitle Size Controls (A− / reset / A+) */}
-            {showSubtitles && (
-              <div
-                className="flex items-center bg-stone-900 border border-stone-800 rounded-lg"
-                title="Subtitle size"
-              >
-                <button
-                  id="subtitle-size-decrease"
-                  type="button"
-                  onPointerDown={() => startSizeHold(-0.1)}
-                  onPointerUp={endSizeHold}
-                  onPointerLeave={endSizeHold}
-                  onPointerCancel={endSizeHold}
-                  disabled={subtitleScale <= 0}
-                  className="px-2 py-1.5 text-xs font-bold text-orange-300 hover:text-white hover:bg-orange-600/40 rounded-l-lg transition-colors disabled:opacity-30 active:bg-orange-600/60"
-                  title="តូចជាង (កាន់ជាប់ = តូចជាបន្តបន្ទាប់)"
-                >
-                  A−
-                </button>
-                <button
-                  id="subtitle-size-reset"
-                  type="button"
-                  onClick={resetSubtitleScale}
-                  className="px-1 py-1 text-[10px] font-mono text-stone-500 hover:text-white transition-colors min-w-[34px]"
-                  title="Reset (100%)"
-                >
-                  {Math.round(subtitleScale * 100)}%
-                </button>
-                <button
-                  id="subtitle-size-increase"
-                  type="button"
-                  onPointerDown={() => startSizeHold(0.1)}
-                  onPointerUp={endSizeHold}
-                  onPointerLeave={endSizeHold}
-                  onPointerCancel={endSizeHold}
-                  disabled={subtitleScale >= 2.5}
-                  className="px-2 py-1.5 text-sm font-bold text-orange-300 hover:text-white hover:bg-orange-600/40 rounded-r-lg transition-colors disabled:opacity-30 active:bg-orange-600/60"
-                  title="ធំជាង (កាន់ជាប់ = ធំជាបន្តបន្ទាប់)"
-                >
-                  A+
-                </button>
-              </div>
-            )}
-
             {mediaType === 'video' && (
               <button
                 id="player-fullscreen"
@@ -1288,7 +1462,7 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
                 max="100"
                 value={Math.round(voiceVolume * 100)}
                 onChange={(e) => setVoiceVolume(parseInt(e.target.value) / 100)}
-                className="flex-1 max-w-[80px] h-1 accent-orange-500"
+                className="flex-1 max-w-[110px] h-1.5 accent-orange-500"
                 title={`AI Voice: ${Math.round(voiceVolume * 100)}%`}
               />
               <span className="text-[10px] font-mono text-orange-400 w-8">

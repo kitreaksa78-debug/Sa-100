@@ -7,11 +7,14 @@ import express from "express";
 import multer from "multer";
 import { createServer as createViteServer } from "vite";
 import https from "https";
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import { promisify } from "util";
-import { writeFile, readFile, unlink, mkdtemp } from "fs/promises";
+import { writeFile, readFile, unlink, mkdtemp, stat, mkdir, rename } from "fs/promises";
+import { createReadStream, mkdirSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { randomUUID } from "crypto";
+import { EdgeTTS } from "@travisvn/edge-tts";
 
 const execFileAsync = promisify(execFile);
 
@@ -21,6 +24,74 @@ const app = express();
 // audio first, but allow the full claimed size in case a browser cannot).
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 52_428_800 } });
 const uploadLarge = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } }); // 100MB for video render
+
+// --- Server-side video job store (real FFmpeg MP4 generation) ---
+type VideoJobStatus = 'queued' | 'uploading' | 'processing' | 'done' | 'error';
+interface VideoJob {
+  id: string;
+  status: VideoJobStatus;
+  progress: number; // 0..100
+  message: string;
+  createdAt: number;
+  inputPath?: string;
+  outputPath?: string;
+  error?: string;
+  originalName?: string;
+  downloadFilename?: string;
+  hasVideo?: boolean;
+  size?: number;
+  targetLanguage?: string;
+  removeVocals?: boolean;
+  segments?: ProcessSegment[];
+}
+interface ProcessSegment {
+  id?: number;
+  start: number;
+  end: number;
+  translatedText?: string;
+  dubbedAudioBase64?: string;
+}
+const videoJobs = new Map<string, VideoJob>();
+const JOBS_ROOT = join(tmpdir(), 'video-jobs');
+const VIDEO_UPLOAD_LIMIT = 200 * 1024 * 1024; // 200 MB for MP4 generation
+const uploadsDir = join(JOBS_ROOT, 'uploads');
+// Cleanup old jobs (older than 90 minutes)
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of videoJobs.entries()) {
+    if (now - job.createdAt > 90 * 60 * 1000) {
+      import('fs/promises').then(fs => fs.rm(join(JOBS_ROOT, id), { recursive: true, force: true }).catch(()=>{}));
+      videoJobs.delete(id);
+    }
+  }
+}, 10 * 60 * 1000);
+
+// Disk-backed upload storage so a large MP4 never has to fit in RAM.
+function ensureJobDirs(): void {
+  try { mkdirSync(JOBS_ROOT, { recursive: true }); } catch { /* noop */ }
+  try { mkdirSync(uploadsDir, { recursive: true }); } catch { /* noop */ }
+}
+const videoUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => { ensureJobDirs(); cb(null, uploadsDir); },
+    filename: (_req, _file, cb) => cb(null, `${randomUUID()}.upload`),
+  }),
+  limits: { fileSize: VIDEO_UPLOAD_LIMIT },
+});
+
+// Detect FFmpeg once at startup; the capabilities endpoint reports it so the
+// client can show a clear server-config error when it is missing.
+let FFMPEG_AVAILABLE = false;
+void (async () => {
+  try {
+    await execFileAsync("ffmpeg", ["-version"], { timeout: 15_000 });
+    FFMPEG_AVAILABLE = true;
+    console.log("[VideoJobs] FFmpeg available — server-side MP4 generation enabled");
+  } catch {
+    FFMPEG_AVAILABLE = false;
+    console.warn("[VideoJobs] FFmpeg NOT found — server-side MP4 generation disabled");
+  }
+})();
 
 // In-memory rotation order for environment GROQ keys. When a key is exhausted
 // (rate limit / quota / server error) it is moved to the end of this list, so
@@ -47,6 +118,85 @@ function getAllGroqKeys(req: express.Request): string[] {
     if (val && !keys.includes(val)) keys.push(val);
   }
   return keys;
+}
+
+// Gemini API keys (GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3) live only
+// in server environment variables. Quota is per Google project, so each env key
+// should belong to a different project. Rotation works the same as Groq.
+const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
+const GEMINI_FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash"];
+let geminiKeyOrder: string[] = ["GEMINI_API_KEY", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3"];
+
+function rotateGeminiKeyToBack(key: string): void {
+  const idx = geminiKeyOrder.findIndex((name) => process.env[name]?.trim() === key);
+  if (idx >= 0 && geminiKeyOrder.length > 1) {
+    const [name] = geminiKeyOrder.splice(idx, 1);
+    geminiKeyOrder.push(name);
+  }
+}
+
+function getGeminiKeys(): string[] {
+  const keys: string[] = [];
+  for (const envKey of geminiKeyOrder) {
+    const val = process.env[envKey]?.trim();
+    if (val && !keys.includes(val)) keys.push(val);
+  }
+  return keys;
+}
+
+async function geminiGenerate(keys: string[], model: string, prompt: string): Promise<Response> {
+  let lastErr: any;
+  for (const key of keys) {
+    try {
+      const res = await fetch(
+        `${GEMINI_BASE}/models/${model}:generateContent?key=${encodeURIComponent(key)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.1, maxOutputTokens: 4096 },
+          }),
+        }
+      );
+      if (res.ok) return res;
+      await res.text().catch(() => "");
+      if (res.status === 429 || res.status >= 500) {
+        lastErr = new Error(`Gemini HTTP ${res.status}`);
+        rotateGeminiKeyToBack(key);
+        continue;
+      }
+      return res;
+    } catch (err) {
+      lastErr = err;
+      rotateGeminiKeyToBack(key);
+    }
+  }
+  throw lastErr || new Error("All Gemini API keys failed");
+}
+
+async function tryGeminiModels(keys: string[], model: string, prompt: string): Promise<any | null> {
+  // Try the selected Gemini model, then built-in flash fallbacks. Shapes the
+  // response like an OpenAI chat completion so parseTranslatedLines works unchanged.
+  const candidates = [model, ...GEMINI_FALLBACK_MODELS].filter((m, i, arr) => arr.indexOf(m) === i);
+  for (const candidate of candidates) {
+    try {
+      const res = await geminiGenerate(keys, candidate, prompt);
+      if (res.ok) {
+        const data: any = await res.json();
+        const parts: any[] = data?.candidates?.[0]?.content?.parts || [];
+        const text = parts.map((p) => p?.text || "").join("").trim();
+        if (text) return { choices: [{ message: { content: text } }] };
+      } else {
+        await res.text().catch(() => "");
+        console.warn(`[Translate] Gemini ${candidate} returned ${res.status}`);
+      }
+    } catch (err: any) {
+      console.warn(`[Translate] Gemini ${candidate} failed:`, err?.message);
+      continue;
+    }
+  }
+  return null;
 }
 
 async function fetchWithKeyFallback(
@@ -138,7 +288,7 @@ function buildTranslationPrompt(
   const langPair = `${sourceLanguage} → ${targetLanguage}`;
   const fullText = segments.map((s: any) => s.originalText || "").join(" ");
   const numbered = segments.map((s: any, i: number) => `${i + 1}. ${s.originalText || ""}`).join("\n");
-  return `You are a professional subtitle translator. Translate each numbered segment below from ${langPair} (${targetLanguageName || targetLanguage}). Every translated line MUST be written in the target language (${targetLanguage}) script — never repeat the source-language text. Use the full transcript below as context so short or ambiguous segments are translated naturally and consistently. Keep the numbering and return ONLY the translated text lines, one per segment, preserving blank lines between segments.\n\nFull transcript: \"${fullText}\"\n\n${numbered}`;
+  return `You are a professional subtitle translator creating natural speech for dubbing. Translate each numbered segment below from ${langPair} (${targetLanguageName || targetLanguage}). Write the way a real person would speak aloud in ${targetLanguage}: natural word order, conversational tone, and clear, easy-to-listen sentences — never a literal word-for-word rendering. Keep each line short enough to fit subtitle timing. Every translated line MUST be written in the target language (${targetLanguage}) script — never repeat the source-language text. Use the full transcript below as context so short or ambiguous segments are translated naturally and consistently. Keep the numbering and return ONLY the translated text lines, one per segment, preserving blank lines between segments.\n\nFull transcript: \"${fullText}\"\n\n${numbered}`;
 }
 
 function buildForcedTranslationPrompt(
@@ -148,7 +298,7 @@ function buildForcedTranslationPrompt(
   segments: any[]
 ): string {
   const numbered = segments.map((s: any, i: number) => `${i + 1}. ${s.originalText || ""}`).join("\n");
-  return `Translate the following subtitle segments from ${sourceLanguage} to ${targetLanguage} (${targetLanguageName || targetLanguage}). Every line MUST be written in the target language's script — never repeat the original-language text. Return one translation per line, numbered to match the input, with no extra text.\n\n${numbered}`;
+  return `Translate the following subtitle segments from ${sourceLanguage} to ${targetLanguage} (${targetLanguageName || targetLanguage}). Write each line the way a real person would speak it aloud: natural, conversational, easy to listen to, short enough for subtitle timing — never literal word-for-word. Every line MUST be written in the target language's script — never repeat the original-language text. Return one translation per line, numbered to match the input, with no extra text.\n\n${numbered}`;
 }
 
 async function tryChatModels(apiKeys: string[], model: string, prompt: string): Promise<any | null> {
@@ -188,6 +338,7 @@ async function tryChatModels(apiKeys: string[], model: string, prompt: string): 
  * or still in the source language) are retried with a strict instruction —
  * first with the user-selected model, then with alternative models — so the
  * displayed translation always respects the user's target-language setting.
+ * Provider (Groq vs Gemini) is chosen from the model id prefix (`gemini/`).
  */
 async function translateSegmentsWithFallback(
   apiKeys: string[],
@@ -200,12 +351,18 @@ async function translateSegmentsWithFallback(
   const lines: string[] = [];
   let pending = segments.map((_, i) => i);
 
+  // Models prefixed `gemini/` use the Gemini API; everything else uses Groq.
+  const callProvider = (m: string, prompt: string) =>
+    m.startsWith("gemini/")
+      ? tryGeminiModels(getGeminiKeys(), m.slice("gemini/".length), prompt)
+      : tryChatModels(apiKeys, m, prompt);
+
   // Run one model+prompt pass over the pending segments, keeping lines that
   // pass the target-script check and re-queueing the rest for another pass.
   const runPass = async (m: string, buildPrompt: (sub: any[]) => string) => {
     if (pending.length === 0) return;
     const prompt = buildPrompt(pending.map((i) => segments[i]));
-    const chatData = await tryChatModels(apiKeys, m, prompt);
+    const chatData = await callProvider(m, prompt);
     const got = chatData
       ? parseTranslatedLines(chatData.choices?.[0]?.message?.content || "")
       : [];
@@ -231,14 +388,17 @@ async function translateSegmentsWithFallback(
   // Pass 3+: strict forced prompt with alternative models, so a model that
   // keeps echoing the source language gets replaced by one that actually
   // writes in the target language's script.
-  const alternatives = [
-    DEFAULT_TRANSLATION_MODEL,
-    "qwen/qwen3.8-27b",
-    "qwen/qwen3.6-27b",
-    "groq/compound-mini",
-    "openai/gpt-oss-20b",
-  ].filter((m, i, arr) => arr.indexOf(m) === i && m !== model);
-  for (const alt of alternatives) {
+  const alternatives = model.startsWith("gemini/")
+    ? ["gemini/gemini-3.6-flash", "gemini/gemini-3.5-flash"]
+    : [
+        DEFAULT_TRANSLATION_MODEL,
+        "qwen/qwen3.8-27b",
+        "qwen/qwen3.6-27b",
+        "groq/compound-mini",
+        "openai/gpt-oss-20b",
+      ];
+  const uniqueAlternatives = alternatives.filter((m, i, arr) => arr.indexOf(m) === i && m !== model);
+  for (const alt of uniqueAlternatives) {
     if (pending.length === 0) break;
     await runPass(alt, (sub) =>
       buildForcedTranslationPrompt(sourceLanguage, targetLanguage, targetLanguageName, sub)
@@ -251,6 +411,40 @@ async function translateSegmentsWithFallback(
     );
   }
   return lines;
+}
+
+// Microsoft Edge neural TTS — natural, human-like voices (free).
+const EDGE_TTS_VOICES: Record<string, string> = {
+  km: "km-KH-PisethNeural", // Khmer (male)
+  en: "en-US-AndrewNeural", // English (male)
+  zh: "zh-CN-XiaoxiaoNeural", // Chinese (female)
+  ja: "ja-JP-NanamiNeural", // Japanese (female)
+  ko: "ko-KR-SunHiNeural", // Korean (female)
+  th: "th-TH-PremwadeeNeural", // Thai (female)
+  vi: "vi-VN-HoaiMyNeural", // Vietnamese (female)
+  fr: "fr-FR-DeniseNeural", // French (female)
+  es: "es-ES-ElviraNeural", // Spanish (female)
+  de: "de-DE-KatjaNeural", // German (female)
+  id: "id-ID-GadisNeural", // Indonesian (female)
+  ru: "ru-RU-SvetlanaNeural", // Russian (female)
+  ar: "ar-SA-ZariyahNeural", // Arabic (female)
+  hi: "hi-IN-SwaraNeural", // Hindi (female)
+  it: "it-IT-ElsaNeural", // Italian (female)
+  pt: "pt-PT-RaquelNeural", // Portuguese (female)
+};
+
+async function edgeTTS(text: string, lang: string): Promise<Buffer | null> {
+  const voice = EDGE_TTS_VOICES[lang];
+  if (!voice) return null;
+  try {
+    const tts = new EdgeTTS(text, voice);
+    const result = await tts.synthesize();
+    const audio = Buffer.from(await result.audio.arrayBuffer());
+    return audio.length > 0 ? audio : null;
+  } catch (err: any) {
+    console.warn(`[EdgeTTS] failed for ${lang}:`, err?.message);
+    return null;
+  }
 }
 
 // Google Translate TTS (free, supports 50+ languages including Khmer)
@@ -327,7 +521,11 @@ app.get("/api/status", (_req, res) => {
       process.env.GROQ_API_KEY2?.trim() ||
       process.env.GROQ_API_KEY3?.trim()
     ),
-    geminiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
+    geminiConfigured: Boolean(
+      process.env.GEMINI_API_KEY?.trim() ||
+      process.env.GEMINI_API_KEY_2?.trim() ||
+      process.env.GEMINI_API_KEY_3?.trim()
+    ),
   });
 });
 
@@ -352,6 +550,38 @@ app.get("/api/check-groq-keys", async (_req, res) => {
     }
   }
   res.json({ keys: results, allOk: results.every((r) => r.ok) });
+});
+
+app.get("/api/check-gemini-keys", async (_req, res) => {
+  // Probe each environment Gemini key (rotation order) and report health.
+  // Never echoes key values — only per-key status. Also returns the model
+  // catalog from the first working key so model ids can be verified.
+  const results: { envKey: string; configured: boolean; ok: boolean; error?: string | null }[] = [];
+  let models: string[] = [];
+  for (const envKey of geminiKeyOrder) {
+    const value = process.env[envKey]?.trim() || "";
+    if (!value) {
+      results.push({ envKey, configured: false, ok: false, error: "not configured" });
+      continue;
+    }
+    try {
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(value)}`,
+        { signal: AbortSignal.timeout(20000) }
+      );
+      if (r.ok && models.length === 0) {
+        const data: any = await r.json();
+        const ids: string[] = ((data?.models || []) as Array<{ name?: string }>)
+          .map((m) => (m.name || "").split("/").pop() || "")
+          .filter((s) => s.length > 0);
+        models = [...new Set(ids)].sort();
+      }
+      results.push({ envKey, configured: true, ok: r.ok, error: r.ok ? null : `HTTP ${r.status}` });
+    } catch (err: any) {
+      results.push({ envKey, configured: true, ok: false, error: `network: ${err?.name || "error"}` });
+    }
+  }
+  res.json({ keys: results, allOk: results.every((r) => r.ok), models });
 });
 
 app.get("/api/list-groq-models", async (_req, res) => {
@@ -522,7 +752,15 @@ app.post("/api/tts", express.json(), async (req, res) => {
     return;
   }
 
-  // 1. Try Google Translate TTS (free, supports 50+ languages including Khmer)
+  // 1. Edge TTS — natural neural voices (human-like speech)
+  const edgeAudio = await edgeTTS(text.trim(), language);
+  if (edgeAudio && edgeAudio.length > 100) {
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.send(edgeAudio);
+    return;
+  }
+
+  // 2. Google Translate TTS (free, supports 50+ languages including Khmer)
   try {
     const audioBuffer = await googleTTS(text.trim(), language);
     if (audioBuffer.length > 100) {
@@ -534,7 +772,7 @@ app.post("/api/tts", express.json(), async (req, res) => {
     console.warn(`[TTS] Google TTS failed for language ${language}:`, err?.message || err);
   }
 
-  // 2. Fallback: Groq Orpheus (English only, higher quality)
+  // 3. Fallback: Groq Orpheus (English only, higher quality)
   const ttsKeys = getAllGroqKeys(req);
   if (ttsKeys.length > 0) {
     try {
@@ -588,17 +826,29 @@ app.post("/api/batch-tts", express.json(), async (req, res) => {
 
     let audioBase64 = "";
 
-    // 1. Try Google Translate TTS (free, multilingual)
+    // 1. Edge TTS — natural neural voice (human-like)
     try {
-      const audioBuffer = await googleTTS(seg.translatedText.trim(), language);
-      if (audioBuffer.length > 100) {
-        audioBase64 = audioBuffer.toString("base64");
+      const edgeAudio = await edgeTTS(seg.translatedText.trim(), language);
+      if (edgeAudio && edgeAudio.length > 100) {
+        audioBase64 = edgeAudio.toString("base64");
       }
     } catch (err: any) {
-      console.warn(`[BatchTTS] Google TTS failed for seg ${seg.id}:`, err?.message);
+      console.warn(`[BatchTTS] Edge TTS failed for seg ${seg.id}:`, err?.message);
     }
 
-    // 2. Fallback: Groq Orpheus (English only)
+    // 2. Google Translate TTS (free, multilingual)
+    if (!audioBase64) {
+      try {
+        const audioBuffer = await googleTTS(seg.translatedText.trim(), language);
+        if (audioBuffer.length > 100) {
+          audioBase64 = audioBuffer.toString("base64");
+        }
+      } catch (err: any) {
+        console.warn(`[BatchTTS] Google TTS failed for seg ${seg.id}:`, err?.message);
+      }
+    }
+
+    // 3. Fallback: Groq Orpheus (English only)
     if (!audioBase64 && ttsKeys.length > 0) {
       try {
         const { res: ttsRes } = await fetchWithKeyFallback(
@@ -719,6 +969,344 @@ app.post("/api/render-mp4", uploadLarge.single("video"), async (req, res) => {
     try { await unlink(inputPath); } catch {}
     try { await unlink(outputPath); } catch {}
     try { await import("fs/promises").then(fs => fs.rm(tmpDir, { recursive: true, force: true })); } catch {}
+  }
+});
+
+// --- Server-side MP4 generation: real FFmpeg pipeline (no browser recording) ---
+// The uploaded original video is stored on disk, then the translated AI voice
+// clips are scheduled onto the original timeline and mixed with the preserved
+// background audio, and finally muxed back with the original (or re-encoded)
+// video stream into a real H.264+AAC MP4. No MediaRecorder / canvas capture.
+
+function setJobProgress(id: string, progress: number, message: string): void {
+  const job = videoJobs.get(id);
+  if (!job) return;
+  job.progress = Math.max(0, Math.min(100, Math.round(progress)));
+  job.message = message;
+}
+
+function sniffAudioKind(buf: Buffer): 'mp3' | 'wav' {
+  // RIFF -> WAV
+  if (buf.length > 12 && buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46) return 'wav';
+  // ID3 tag or MPEG sync word -> MP3
+  if (buf.length > 4 && ((buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0) || (buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33))) return 'mp3';
+  return 'mp3';
+}
+
+const MIME_EXT: Record<string, string> = {
+  'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov', 'video/x-matroska': 'mkv', 'video/m4v': 'm4v',
+  'audio/mpeg': 'mp3', 'audio/mp3': 'mp3', 'audio/wav': 'wav', 'audio/x-wav': 'wav',
+  'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a', 'audio/aac': 'aac', 'audio/ogg': 'ogg', 'audio/webm': 'webm', 'audio/flac': 'flac', 'audio/opus': 'opus',
+};
+function safeExt(mime: string | undefined, name: string | undefined): string {
+  const fromMime = mime ? MIME_EXT[mime.toLowerCase()] : undefined;
+  if (fromMime) return fromMime;
+  const m = (name || '').toLowerCase().match(/\.([a-z0-9]{2,5})$/);
+  const ext = m ? m[1] : '';
+  return ['mp4','webm','mov','mkv','m4v','mp3','wav','m4a','aac','ogg','flac','opus'].includes(ext) ? ext : 'mp4';
+}
+
+function isVideoMime(mime: string | undefined, name: string | undefined): boolean {
+  if ((mime || '').startsWith('video/')) return true;
+  return /\.(mp4|webm|mov|mkv|m4v)$/i.test(name || '');
+}
+
+/** Run FFmpeg, parsing `-progress pipe:1` (out_time_us) for real render progress. */
+function runFfmpegWithProgress(
+  args: string[],
+  totalDuration: number,
+  onProgress: (fraction: number) => void,
+  timeoutMs = 20 * 60 * 1000
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      settled = true;
+      try { proc.kill('SIGKILL'); } catch { /* noop */ }
+      reject(new Error('FFmpeg timed out'));
+    }, timeoutMs);
+    proc.stdout.on('data', (d: Buffer) => {
+      stdout += d.toString();
+      if (stdout.length > 60_000) stdout = stdout.slice(-20_000);
+      const m = stdout.match(/out_time_us=(\d+)/g) || stdout.match(/out_time_ms=(\d+)/g);
+      if (m && totalDuration > 0) {
+        const last = m[m.length - 1];
+        const us = Number(last.split('=')[1]);
+        if (Number.isFinite(us) && us > 0) onProgress(Math.min(1, us / 1e6 / totalDuration));
+      }
+    });
+    proc.stderr.on('data', (d: Buffer) => {
+      stderr += d.toString();
+      if (stderr.length > 60_000) stderr = stderr.slice(-20_000);
+    });
+    proc.on('error', (err) => { if (!settled) { settled = true; clearTimeout(timer); reject(err); } });
+    proc.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) resolve(stderr);
+      else reject(new Error(`FFmpeg exited with code ${code}: ${stderr.slice(-600)}`));
+    });
+  });
+}
+
+async function probeDuration(ffprobeArgs: string[]): Promise<number> {
+  try {
+    const res = await execFileAsync('ffprobe', ffprobeArgs, { timeout: 20_000 });
+    const n = Number(res.stdout.trim());
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function processVideoJob(jobId: string): Promise<void> {
+  const job = videoJobs.get(jobId);
+  if (!job || !job.inputPath) return;
+  const jobDir = join(JOBS_ROOT, jobId);
+  try {
+    setJobProgress(jobId, 12, 'Analyzing media');
+
+    // 1. Probe the original file
+    const probeRes = await execFileAsync('ffprobe', [
+      '-v', 'error', '-show_format', '-show_streams', '-of', 'json', job.inputPath,
+    ], { timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
+    const info = JSON.parse(probeRes.stdout || '{}');
+    const streams: any[] = info.streams || [];
+    const vStream = streams.find((s) => s.codec_type === 'video');
+    const aStream = streams.find((s) => s.codec_type === 'audio');
+    const duration = Number(info.format?.duration || vStream?.duration || aStream?.duration || 0) || 0;
+    job.hasVideo = Boolean(vStream);
+    setJobProgress(jobId, 16, 'Extracting audio');
+
+    // 2. Decode + probe the translated AI voice clips
+    const segs: ProcessSegment[] = job.segments || [];
+    const clips: { start: number; end: number; path: string; duration: number }[] = [];
+    const withAudio = segs.filter((s) => (s.dubbedAudioBase64 || '').length > 100);
+    for (let i = 0; i < withAudio.length; i++) {
+      const seg = withAudio[i];
+      try {
+        const buf = Buffer.from(seg.dubbedAudioBase64 || '', 'base64');
+        if (buf.length < 100) continue;
+        const kind = sniffAudioKind(buf);
+        const clipPath = join(jobDir, `clip_${String(clips.length).padStart(4, '0')}.${kind}`);
+        await writeFile(clipPath, buf);
+        const dur = await probeDuration(['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', clipPath]);
+        if (dur > 0.05) clips.push({ start: Math.max(0, seg.start), end: Math.max(seg.end, seg.start + 0.3), path: clipPath, duration: dur });
+      } catch (err: any) {
+        console.warn(`[VideoJobs] clip ${i} failed:`, err?.message);
+      }
+      setJobProgress(jobId, 20 + Math.round(25 * ((i + 1) / Math.max(withAudio.length, 1))), `Generating translated audio (${i + 1}/${withAudio.length})`);
+    }
+
+    setJobProgress(jobId, 50, 'Mixing audio');
+
+    // 3. Build the FFmpeg mix + mux command
+    const args: string[] = ['-y', '-i', job.inputPath];
+    for (const c of clips) args.push('-i', c.path);
+    const filters: string[] = [];
+    const hasAudio = Boolean(aStream);
+    const stereo = (aStream?.channels || 0) >= 2;
+    const applyCenterCancel = job.removeVocals === true && stereo;
+
+    if (hasAudio) {
+      filters.push(
+        applyCenterCancel
+          ? '[0:a]aformat=channel_layouts=stereo,pan=stereo|c0=c0-c1|c1=c1-c0[bg0]'
+          : '[0:a]aformat=channel_layouts=stereo[bg0]'
+      );
+      const cond = clips.map((c) => `between(t,${c.start.toFixed(2)},${c.end.toFixed(2)})`).join('+');
+      filters.push(
+        cond
+          ? `[bg0]volume='if(${cond}>=1,0.45,1)':eval=frame[bg]`
+          : '[bg0]anull[bg]'
+      );
+    }
+
+    clips.forEach((c, i) => {
+      const segDur = Math.max(c.end - c.start, 0.4);
+      const rate = Math.min(Math.max(c.duration / segDur, 0.85), 2.0);
+      const delayMs = Math.max(0, Math.round(c.start * 1000));
+      let chain = 'aformat=channel_layouts=stereo';
+      if (Math.abs(rate - 1) > 0.02) chain += `,atempo=${rate.toFixed(3)}`;
+      chain += `,adelay=${delayMs}|${delayMs}:all=1`;
+      filters.push(`[${i + 1}:a]${chain}[v${i}]`);
+    });
+
+    let aout: string | null = null;
+    if (hasAudio) {
+      const inputs = ['[bg]', ...clips.map((_, i) => `[v${i}]`)];
+      if (inputs.length === 1) {
+        aout = '[bg]';
+      } else {
+        filters.push(`${inputs.join('')}amix=inputs=${inputs.length}:duration=first:dropout_transition=0:normalize=0,aresample=48000[aout]`);
+        aout = '[aout]';
+      }
+    } else if (clips.length > 0) {
+      const inputs = clips.map((_, i) => `[v${i}]`);
+      if (inputs.length === 1) {
+        aout = inputs[0];
+      } else {
+        filters.push(`${inputs.join('')}amix=inputs=${inputs.length}:duration=longest:dropout_transition=0:normalize=0,aresample=48000[aout]`);
+        aout = '[aout]';
+      }
+    }
+
+    const isVideo = Boolean(vStream);
+    const outputPath = join(jobDir, 'output.mp4');
+    const buildArgs = (copyVideo: boolean): string[] => {
+      const a: string[] = ['-y', '-i', job.inputPath!];
+      for (const c of clips) a.push('-i', c.path);
+      if (filters.length > 0) a.push('-filter_complex', filters.join(';'));
+      if (isVideo) a.push('-map', '0:v:0');
+      if (aout) a.push('-map', aout);
+      if (isVideo) {
+        if (copyVideo) a.push('-c:v', 'copy');
+        else a.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p');
+      }
+      if (aout) a.push('-c:a', 'aac', '-b:a', '192k', '-ar', '48000');
+      if (isVideo) a.push('-movflags', '+faststart', '-shortest');
+      a.push(outputPath);
+      return a;
+    };
+
+    const canCopyVideo = Boolean(
+      vStream && vStream.codec_name === 'h264' && ['yuv420p', 'yuvj420p'].includes(String(vStream.pix_fmt || ''))
+    );
+    let usedCopy = false;
+    try {
+      if (canCopyVideo) {
+        await runFfmpegWithProgress(buildArgs(true), duration || 0, (f) => setJobProgress(jobId, 60 + Math.round(30 * f), `Rendering MP4 (${Math.round(f * 100)}%)`));
+        usedCopy = true;
+      } else {
+        throw new Error('re-encode required');
+      }
+    } catch {
+      setJobProgress(jobId, 60, 'Rendering MP4 (re-encoding video)');
+      await runFfmpegWithProgress(buildArgs(false), duration || 0, (f) => setJobProgress(jobId, 60 + Math.round(30 * f), `Rendering MP4 (${Math.round(f * 100)}%)`));
+    }
+
+    // 4. Validate the output
+    const outProbe = await execFileAsync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_name,codec_type', '-of', 'json', outputPath], { timeout: 20_000 });
+    const outInfo = JSON.parse(outProbe.stdout || '{}');
+    const outStreams: any[] = outInfo.streams || [];
+    if (outStreams.length === 0) throw new Error('FFmpeg produced no valid streams');
+    const outSize = (await stat(outputPath)).size;
+    if (outSize < 1000) throw new Error('Output file is too small to be valid');
+
+    const now = new Date();
+    const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}`;
+    const filename = isVideo ? `translated-${job.targetLanguage || 'video'}-${stamp}.mp4` : `translated-${job.targetLanguage || 'audio'}-${stamp}.m4a`;
+
+    job.status = 'done';
+    job.progress = 100;
+    job.message = 'Ready';
+    job.outputPath = outputPath;
+    job.downloadFilename = filename;
+    job.size = outSize;
+    console.log(`[VideoJobs] Job ${jobId} done: ${filename} (${(outSize / 1024 / 1024).toFixed(1)}MB, copy=${usedCopy})`);
+  } catch (err: any) {
+    console.error(`[VideoJobs] Job ${jobId} failed:`, err?.message || err);
+    job.status = 'error';
+    job.error = err?.message || 'MP4 generation failed';
+    job.progress = 100;
+  }
+}
+
+app.get('/api/video/capabilities', (_req, res) => {
+  res.json({ ffmpeg: FFMPEG_AVAILABLE, chunked: false, maxUploadBytes: VIDEO_UPLOAD_LIMIT });
+});
+
+app.post('/api/video/upload', videoUpload.single('video'), async (req, res) => {
+  if (!FFMPEG_AVAILABLE) {
+    res.status(501).json({ error: 'FFmpeg is not installed on the server — MP4 generation is unavailable.' });
+    return;
+  }
+  const file = req.file as Express.Multer.File | undefined;
+  if (!file) {
+    res.status(400).json({ error: 'No video file provided' });
+    return;
+  }
+  const id = randomUUID();
+  const jobDir = join(JOBS_ROOT, id);
+  try {
+    await mkdir(jobDir, { recursive: true });
+    const ext = safeExt(file.mimetype, file.originalname);
+    const inputPath = join(jobDir, `original.${ext}`);
+    await rename(file.path, inputPath);
+    videoJobs.set(id, {
+      id, status: 'queued', progress: 5, message: 'Uploaded', createdAt: Date.now(),
+      inputPath, originalName: file.originalname, hasVideo: isVideoMime(file.mimetype, file.originalname), targetLanguage: 'km',
+    });
+    res.json({ jobId: id, hasVideo: isVideoMime(file.mimetype, file.originalname), size: file.size });
+  } catch (err: any) {
+    try { await unlink(file.path); } catch { /* noop */ }
+    res.status(500).json({ error: err?.message || 'Failed to store upload' });
+  }
+});
+
+app.post('/api/video/process', express.json({ limit: '80mb' }), async (req, res) => {
+  const { jobId, segments, removeVocals = true, targetLanguage = 'km' } = req.body || {};
+  const job = videoJobs.get(jobId);
+  if (!job) {
+    res.status(404).json({ error: 'Unknown jobId — please upload the video again.' });
+    return;
+  }
+  if (!Array.isArray(segments) || segments.length === 0) {
+    res.status(400).json({ error: 'No subtitle segments provided' });
+    return;
+  }
+  if (job.status === 'processing') {
+    res.json({ jobId, status: 'processing', progress: job.progress });
+    return;
+  }
+  if (job.status === 'done') {
+    res.json({ jobId, status: 'done', progress: 100 });
+    return;
+  }
+  job.segments = segments as ProcessSegment[];
+  job.removeVocals = Boolean(removeVocals);
+  job.targetLanguage = String(targetLanguage || 'km');
+  job.status = 'processing';
+  job.progress = 10;
+  job.message = 'Preparing';
+  job.error = undefined;
+  res.json({ jobId, status: 'processing' });
+  void processVideoJob(jobId);
+});
+
+app.get('/api/video/status/:id', (req, res) => {
+  const job = videoJobs.get(req.params.id);
+  if (!job) {
+    res.status(404).json({ error: 'Unknown jobId' });
+    return;
+  }
+  res.json({
+    jobId: job.id, status: job.status, progress: job.progress, message: job.message,
+    error: job.error, hasVideo: job.hasVideo,
+    size: job.status === 'done' ? job.size : undefined,
+    downloadFilename: job.status === 'done' ? job.downloadFilename : undefined,
+  });
+});
+
+app.get('/api/video/download/:id', async (req, res) => {
+  const job = videoJobs.get(req.params.id);
+  if (!job || job.status !== 'done' || !job.outputPath) {
+    res.status(404).json({ error: 'Video is not ready yet' });
+    return;
+  }
+  try {
+    const size = (await stat(job.outputPath)).size;
+    res.setHeader('Content-Type', job.hasVideo ? 'video/mp4' : 'audio/mp4');
+    res.setHeader('Content-Length', String(size));
+    res.setHeader('Content-Disposition', `attachment; filename="${job.downloadFilename || 'translated-video.mp4'}"`);
+    res.setHeader('Cache-Control', 'private, max-age=600');
+    createReadStream(job.outputPath).pipe(res);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Download failed' });
   }
 });
 

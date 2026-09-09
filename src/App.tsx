@@ -12,6 +12,7 @@ import {
   Download,
 } from 'lucide-react';
 import { Header } from './components/Header';
+import { WelcomePage } from './components/WelcomePage';
 import { ApiKeyModal } from './components/ApiKeyModal';
 import { MediaUploader } from './components/MediaUploader';
 import { OptionsBar } from './components/OptionsBar';
@@ -23,8 +24,18 @@ import { SubtitleSegment, TranscriptionResult, ServerStatus } from './types';
 import { LANGUAGES, SampleMedia } from './data/languages';
 import { exportToSrt, exportToVtt } from './utils/subtitleUtils';
 import { apiUrl } from './utils/api';
+import { exportEditedMp4ServerSide } from './utils/mp4Job';
 import { shrinkMediaToAudio } from './utils/mediaCompress';
+import { extractVocalEmphasizedAudio } from './utils/vocalSeparation';
 import { recordUsage } from './utils/usageTracker';
+import {
+  GoogleUser,
+  clearUser,
+  loadGroqKey,
+  loadUser,
+  saveGroqKey,
+  saveUser,
+} from './utils/googleAuth';
 
 // The deployed site runs the API as a serverless function that rejects request
 // bodies over ~4.5 MB (HTTP 413). Anything above this guardrail must be shrunk
@@ -37,9 +48,40 @@ export default function App() {
   const [uiLang, setUiLang] = useState<UILang>('km');
   const t = UI_TEXT[uiLang];
 
-  // Groq API Key management
+  // Google sign-in state: new visitors see the welcome page first, and
+  // "Get started" connects with Google before entering the workspace.
+  const [user, setUser] = useState<GoogleUser | null>(() => loadUser());
+  const [authSkipped, setAuthSkipped] = useState(false);
+
+  const handleGoogleSignedIn = (u: GoogleUser) => {
+    saveUser(u);
+    setUser(u);
+    // Load THIS account's saved API key (each account keeps its own data).
+    setGroqKey(loadGroqKey(u.sub));
+  };
+
+  const resetWorkspaceState = () => {
+    setSelectedFile(null);
+    setMediaPreviewUrl(null);
+    setMediaType(null);
+    setResult(null);
+    setErrorMessage(null);
+    clearExportedResult();
+  };
+
+  const handleSignOut = () => {
+    clearUser();
+    setUser(null);
+    setAuthSkipped(false);
+    // Never leak the signed-out account's in-memory data to the next user.
+    setGroqKey('');
+    resetWorkspaceState();
+  };
+
+  // Groq API Key management — stored per account, so each Google account
+  // keeps its own key (guests keep the legacy shared key).
   const [groqKey, setGroqKey] = useState<string>(() => {
-    return localStorage.getItem('groq_api_key') || '';
+    return loadGroqKey(loadUser()?.sub);
   });
   const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false);
   const [serverStatus, setServerStatus] = useState<ServerStatus>({
@@ -75,27 +117,46 @@ export default function App() {
   const [dubbingProgress, setDubbingProgress] = useState<number>(0);
   const [dubbingTotal, setDubbingTotal] = useState<number>(0);
   const [muteOriginal, setMuteOriginal] = useState(false);
+  // Smart export: strip the original voice, keep only music + translated voice.
+  const [removeVocalsOnExport, setRemoveVocalsOnExport] = useState(true);
 
-  // Export dubbed video state
+  // Server-side MP4 generation state (real FFmpeg job — no browser recording)
   const [isExportingDubbed, setIsExportingDubbed] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
+  const [exportStep, setExportStep] = useState<string | null>(null);
   // Rendered (AI-dubbed) video ready for preview & download
   const [exportedResult, setExportedResult] = useState<{
     url: string;
     ext: string;
     size: number;
     filename: string;
+    isServerMp4: boolean;
   } | null>(null);
 
   const clearExportedResult = () => {
     setExportedResult((prev) => {
-      if (prev) URL.revokeObjectURL(prev.url);
+      if (prev && !prev.isServerMp4) URL.revokeObjectURL(prev.url);
       return null;
     });
   };
 
   const handleDownloadExported = () => {
     if (!exportedResult) return;
+    // Server-generated MP4: navigate straight to the real file URL so the
+    // browser downloads the actual .mp4 produced by FFmpeg.
+    if (exportedResult.isServerMp4) {
+      const a = document.createElement('a');
+      a.href = exportedResult.url;
+      a.download = exportedResult.filename;
+      a.style.display = 'none';
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        document.body.removeChild(a);
+      }, 200);
+      return;
+    }
     const a = document.createElement('a');
     a.href = exportedResult.url;
     a.download = exportedResult.filename;
@@ -130,11 +191,7 @@ export default function App() {
 
   const handleSaveApiKey = (newKey: string) => {
     setGroqKey(newKey);
-    if (newKey) {
-      localStorage.setItem('groq_api_key', newKey);
-    } else {
-      localStorage.removeItem('groq_api_key');
-    }
+    saveGroqKey(user?.sub, newKey);
   };
 
   const isGroqActive = Boolean(serverStatus.groqConfigured || groqKey.trim());
@@ -204,7 +261,21 @@ export default function App() {
           if (response.ok) {
             const blob = await response.blob();
             if (blob && blob.size > 0) {
-              fileToUpload = new File([blob], `media-${Date.now()}.${mediaType === 'video' ? 'mp4' : 'wav'}`, {
+              // Name the sample by its REAL container so Whisper can decode it
+              // (Groq uses the file extension to pick the codec — a misnamed
+              // audio sample would be rejected even though the bytes are fine).
+              const extFromMime = (mime: string): string => {
+                if (!mime) return '';
+                if (mime.includes('mpeg') || mime.includes('mp3')) return 'mp3';
+                if (mime.includes('wav')) return 'wav';
+                if (mime.includes('webm')) return 'webm';
+                if (mime.includes('ogg')) return 'ogg';
+                if (mime.includes('mp4') || mime.includes('m4a') || mime.includes('aac')) return 'm4a';
+                return '';
+              };
+              const sampleExt =
+                (mediaType === 'video' ? 'mp4' : extFromMime(blob.type) || 'wav');
+              fileToUpload = new File([blob], `media-${Date.now()}.${sampleExt}`, {
                 type: blob.type || (mediaType === 'video' ? 'video/mp4' : 'audio/wav'),
               });
             }
@@ -216,6 +287,32 @@ export default function App() {
 
       if (!fileToUpload) {
         throw new Error('Please upload an audio or video file from your device, or record your voice.');
+      }
+
+      // SMART AUDIO: before uploading, try to separate the speech/singing from
+      // the music. For true-stereo sources (most songs, movies, TV) the vocal
+      // track is emphasized and sent to Whisper on its own — so the transcript
+      // contains the LYRICS, not the band, and background noise/effects are
+      // never transcribed. Mono/dual-mono clips cannot be separated, so they
+      // keep the original audio (zero regression). Runs in real time (≈ clip
+      // duration), showing live progress.
+      setProcessingStep(t.separatingVocals);
+      const vocalTrack = await extractVocalEmphasizedAudio(fileToUpload, (fraction) => {
+        const pct = Math.min(99, Math.round(fraction * 100));
+        setProcessingStep(`${t.separatingVocals} (${pct}%)`);
+      });
+      if (vocalTrack && vocalTrack.separable && vocalTrack.blob && vocalTrack.blob.size > 2000) {
+        if (vocalTrack.silent) {
+          throw new Error(t.noSpeechDetected);
+        }
+        const baseName =
+          fileToUpload instanceof File && fileToUpload.name
+            ? fileToUpload.name.replace(/\.[^.]+$/, '')
+            : 'media';
+        const ext = /mp4|m4a|aac/i.test(vocalTrack.blob.type) ? 'm4a' : 'webm';
+        fileToUpload = new File([vocalTrack.blob], `${baseName}.${ext}`, {
+          type: vocalTrack.blob.type || 'audio/webm',
+        });
       }
 
       // The hosted serverless API rejects request bodies over ~4.5 MB, so media
@@ -299,9 +396,9 @@ export default function App() {
 
       setResult(data);
       setCurrentTime(0);
-      // Track today's free-quota usage (per model) on this browser.
-      recordUsage(whisperModel);
-      recordUsage(translationModel);
+      // Track today's free-quota usage (per model) — separately per account.
+      recordUsage(whisperModel, user?.sub);
+      recordUsage(translationModel, user?.sub);
     } catch (err: any) {
       console.error('Transcription error:', err);
       setErrorMessage(err.message || 'An error occurred during transcription.');
@@ -355,7 +452,7 @@ export default function App() {
       }
 
       setTargetLang(newTargetLang);
-      recordUsage(translationModel);
+      recordUsage(translationModel, user?.sub);
       setResult((prev) => {
         if (!prev) return null;
         return {
@@ -463,9 +560,15 @@ export default function App() {
     }
   };
 
-  // Export the dubbed video file (video + AI voice mix burned in)
+  // Export the dubbed video file.
+  // 1) Preferred: server-side FFmpeg job — the original video is uploaded,
+  //    the translated AI voice clips are scheduled onto the timeline, mixed
+  //    with the preserved background audio and muxed into a real H.264+AAC
+  //    MP4 (video stream copied whenever possible). No browser recording.
+  // 2) Fallback (serverless deploys without ffmpeg): legacy client-side
+  //    MediaRecorder export, only when the server pipeline is unavailable.
   const handleExportDubbed = async () => {
-    if (!mediaPlayerHandleRef.current || isExportingDubbed) return;
+    if (isExportingDubbed) return;
     if (!result?.segments.some((s) => s.dubbedAudioBase64)) {
       setErrorMessage(t.exportDubbedFailed);
       return;
@@ -473,9 +576,33 @@ export default function App() {
 
     setIsExportingDubbed(true);
     setExportProgress(0);
+    setExportStep(t.mp4JobStepUploading);
     setErrorMessage(null);
 
     try {
+      const serverResult = await exportEditedMp4ServerSide(result, {
+        selectedFile,
+        mediaPreviewUrl,
+        mediaType,
+        targetLanguage: result.targetLanguage,
+        removeVocals: removeVocalsOnExport,
+        setExportStep,
+        setExportProgress: (p) => setExportProgress(p),
+      });
+      if (serverResult) {
+        setExportedResult((prev) => {
+          if (prev && !prev.isServerMp4) URL.revokeObjectURL(prev.url);
+          return { ...serverResult, isServerMp4: true };
+        });
+        return;
+      }
+
+      // Server pipeline unavailable (no ffmpeg / non-Express deploy) — fall
+      // back to the legacy in-browser recording export.
+      if (!mediaPlayerHandleRef.current) {
+        throw new Error(t.exportDubbedFailed);
+      }
+      setExportStep(null);
       const out = await mediaPlayerHandleRef.current.exportDubbed((p) => setExportProgress(p));
       if (!out) {
         throw new Error(t.exportDubbedFailed);
@@ -488,6 +615,7 @@ export default function App() {
           ext: out.ext,
           size: out.blob.size,
           filename: `dubbed-${result.targetLanguage}-${Date.now()}.${out.ext}`,
+          isServerMp4: false,
         };
       });
     } catch (err: any) {
@@ -496,6 +624,7 @@ export default function App() {
     } finally {
       setIsExportingDubbed(false);
       setExportProgress(0);
+      setExportStep(null);
     }
   };
 
@@ -521,12 +650,26 @@ export default function App() {
     });
   };
 
+  // Welcome page shown to signed-out visitors; "Get started" connects with Google.
+  if (!user && !authSkipped) {
+    return (
+      <WelcomePage
+        uiLang={uiLang}
+        setUiLang={setUiLang}
+        onSignedIn={handleGoogleSignedIn}
+        onContinueWithoutAccount={() => setAuthSkipped(true)}
+      />
+    );
+  }
+
   return (
     <div className="min-h-screen text-stone-900 flex flex-col font-sans">
       {/* Header */}
       <Header
         uiLang={uiLang}
         setUiLang={setUiLang}
+        user={user}
+        onSignOut={handleSignOut}
       />
 
       {/* Main Workspace */}
@@ -582,6 +725,7 @@ export default function App() {
           onTranscribeAndTranslate={handleTranscribeAndTranslate}
           isProcessing={isProcessing}
           canProcess={Boolean(selectedFile || mediaPreviewUrl)}
+          userId={user?.sub}
         />
 
         {/* Processing Indicator */}
@@ -606,6 +750,7 @@ export default function App() {
               onRetranslate={handleRetranslate}
               isRetranslating={isRetranslating}
               uiLang={uiLang}
+              mediaType={mediaType}
               onGenerateDubbing={handleGenerateDubbing}
               isGeneratingDubbing={isGeneratingDubbing}
               dubbingProgress={dubbingProgress}
@@ -613,9 +758,12 @@ export default function App() {
               onExportDubbed={handleExportDubbed}
               isExportingDubbed={isExportingDubbed}
               exportProgress={exportProgress}
+              exportStep={exportStep}
+              removeVocalsOnExport={removeVocalsOnExport}
+              setRemoveVocalsOnExport={setRemoveVocalsOnExport}
             />
 
-            {/* AI-Rendered Video Preview (watch the final dubbed video & download) */}
+            {/* AI-Rendered Media Preview (watch/listen to the final dubbed file & download) */}
             {exportedResult && (
               <div className="bg-white rounded-2xl border border-indigo-200 shadow-xs p-4 sm:p-5 space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-3">
@@ -624,7 +772,9 @@ export default function App() {
                       <Film className="w-4 h-4" />
                     </span>
                     <div className="min-w-0">
-                      <h3 className="text-xs font-bold text-stone-800">{t.renderedTitle}</h3>
+                      <h3 className="text-xs font-bold text-stone-800">
+                        {mediaType === 'audio' ? t.renderedTitleAudio : t.renderedTitle}
+                      </h3>
                       <p className="text-[11px] text-stone-500 font-mono truncate">
                         {exportedResult.filename} · {(exportedResult.size / (1024 * 1024)).toFixed(2)} MB
                       </p>
@@ -639,7 +789,8 @@ export default function App() {
                     >
                       <Download className="w-3.5 h-3.5" />
                       <span>
-                        {t.downloadRendered} ({exportedResult.ext.toUpperCase()})
+                        {mediaType === 'audio' ? t.downloadRenderedAudio : t.downloadRendered} (
+                        {exportedResult.ext.toUpperCase()})
                       </span>
                     </button>
                     <button
@@ -652,13 +803,23 @@ export default function App() {
                     </button>
                   </div>
                 </div>
-                <video
-                  controls
-                  playsInline
-                  src={exportedResult.url}
-                  className="w-full max-h-[70vh] rounded-xl bg-black"
-                />
-                <p className="text-[11px] text-indigo-600 font-medium">✅ {t.renderedReady}</p>
+                {mediaType === 'audio' ? (
+                  <audio
+                    controls
+                    src={exportedResult.url}
+                    className="w-full"
+                  />
+                ) : (
+                  <video
+                    controls
+                    playsInline
+                    src={exportedResult.url}
+                    className="w-full max-h-[70vh] rounded-xl bg-black"
+                  />
+                )}
+                <p className="text-[11px] text-indigo-600 font-medium">
+                  ✅ {mediaType === 'audio' ? t.renderedReadyAudio : t.renderedReady}
+                </p>
               </div>
             )}
 
@@ -687,6 +848,7 @@ export default function App() {
                   uiLang={uiLang}
                   muteOriginal={muteOriginal}
                   setMuteOriginal={setMuteOriginal}
+                  removeVocalsOnExport={removeVocalsOnExport}
                 />
               </div>
 

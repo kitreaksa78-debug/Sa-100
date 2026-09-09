@@ -57,13 +57,13 @@ export interface ShrunkMedia {
 }
 
 /** Pick an audio bitrate that keeps the clip under the target byte budget. */
-function pickAudioBitrate(durationSeconds: number, targetBytes: number, floorBps: number): number {
+export function pickAudioBitrate(durationSeconds: number, targetBytes: number, floorBps: number): number {
   if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return 48_000;
   const targetBps = Math.floor((targetBytes * 8) / durationSeconds);
   return Math.min(MAX_BPS, Math.max(floorBps, targetBps));
 }
 
-function pickSupportedAudioMime(): string {
+export function pickSupportedAudioMime(): string {
   if (typeof MediaRecorder === 'undefined') return '';
   const candidates = [
     'audio/webm;codecs=opus',
@@ -87,7 +87,7 @@ function sampleRms(analyser: AnalyserNode): number {
   return Math.sqrt(sum / data.length);
 }
 
-function recordStream(
+export function recordStream(
   stream: MediaStream,
   durationMs: number,
   audioBitsPerSecond: number,
