@@ -1149,7 +1149,8 @@ def _process_video_job(job_id):
                 filters.append("".join(inputs) + "amix=inputs=%d:duration=longest:dropout_transition=0:normalize=0,aresample=48000[aout]" % len(inputs))
                 aout = "[aout]"
 
-        output_path = os.path.join(job_dir, "output.mp4")
+        output_ext = "mp3" if not has_video else "mp4"
+        output_path = os.path.join(job_dir, "output.%s" % output_ext)
 
         def build_args(copy_video):
             a = ["-y", "-i", job["inputPath"]]
@@ -1167,36 +1168,50 @@ def _process_video_job(job_id):
                 else:
                     a += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"]
             if aout:
-                a += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+                if has_video:
+                    a += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+                else:
+                    a += ["-c:a", "libmp3lame", "-b:a", "192k", "-ar", "48000"]
             if has_video:
                 a += ["-movflags", "+faststart", "-shortest"]
             a += [output_path]
             return a
 
-        can_copy = info["vcodec"] == "h264" and info["vpix"] in ("yuv420p", "yuvj420p")
+        can_copy = has_video and info["vcodec"] == "h264" and info["vpix"] in ("yuv420p", "yuvj420p")
         ffmpeg_bin = _ffmpeg_exe() or "ffmpeg"
+        result = None
         try:
             if can_copy:
                 result = subprocess.run([ffmpeg_bin] + build_args(True), capture_output=True, timeout=1200)
                 if result.returncode != 0:
                     err_msg = (result.stderr or b"").decode(errors="ignore")[-500:]
                     print("[VideoJobs] FFmpeg copy failed (code %d): %s" % (result.returncode, err_msg))
-                    raise RuntimeError("FFmpeg copy failed: %s" % err_msg[:200])
+                    result = None  # fall through to re-encode
+                else:
+                    print("[VideoJobs] FFmpeg copy succeeded")
             else:
                 raise RuntimeError("re-encode required")
-        except Exception:
-            _set_job(job_id, progress=60, message="Rendering MP4 (re-encoding video)")
-            result = subprocess.run([ffmpeg_bin] + build_args(False), capture_output=True, timeout=1200)
+        except Exception as e:
+            print("[VideoJobs] FFmpeg copy pass failed: %s" % e)
+            result = None
+
+        if result is None or (result and result.returncode != 0):
+            _set_job(job_id, progress=60, message="Rendering (re-encoding)")
+            args_re = build_args(False)
+            print("[VideoJobs] FFmpeg args: %s" % " ".join(args_re[:6]))
+            result = subprocess.run([ffmpeg_bin] + args_re, capture_output=True, timeout=1200)
             if result.returncode != 0:
                 err_msg = (result.stderr or b"").decode(errors="ignore")[-500:]
                 print("[VideoJobs] FFmpeg re-encode failed (code %d): %s" % (result.returncode, err_msg))
-                raise RuntimeError("FFmpeg render failed: %s" % err_msg[:200])
+                raise RuntimeError("FFmpeg render failed (code %d): %s" % (result.returncode, err_msg[:200]))
+            print("[VideoJobs] FFmpeg re-encode succeeded")
 
         if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
-            raise RuntimeError("FFmpeg produced no valid output")
+            stderr_txt = (result.stderr if result else b"").decode(errors="ignore")[-300:]
+            raise RuntimeError("FFmpeg produced no valid output. FFmpeg stderr: %s" % stderr_txt[:200])
 
         now = time.strftime("%Y%m%d-%H%M")
-        ext = "m4a" if not has_video else "mp4"
+        ext = "mp3" if not has_video else "mp4"
         filename = "translated-%s-%s.%s" % (job.get("targetLanguage") or ("video" if has_video else "audio"), now, ext)
         _set_job(
             job_id,
@@ -1346,7 +1361,7 @@ def handle_video_download():
     path = job["outputPath"]
     if not os.path.exists(path):
         return jsonify({"error": "Output file is missing"}), 404
-    mimetype = "video/mp4" if job.get("hasVideo") else "audio/mp4"
+    mimetype = "video/mp4" if job.get("hasVideo") else "audio/mpeg"
     filename = job.get("downloadFilename") or "translated-video.mp4"
     return send_file(path, mimetype=mimetype, as_attachment=True, download_name=filename)
 
