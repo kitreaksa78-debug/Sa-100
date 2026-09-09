@@ -10,13 +10,12 @@ import {
   Subtitles,
   Music,
   Radio,
-  Bot,
 } from 'lucide-react';
 import { SubtitleSegment } from '../types';
 import { formatClockTime, speakText, stopSpeaking } from '../utils/subtitleUtils';
 import { buildExportPath, setVocalRemoval, type ExportPath } from '../utils/audioEngine';
 import { isSeparableBuffer } from '../utils/vocalSeparation';
-import { TalkingAvatar } from './TalkingAvatar';
+
 import { UILang, UI_TEXT } from '../data/translations';
 
 export interface MediaPlayerHandle {
@@ -436,7 +435,7 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
   };
   const [isAiVoiceDubbing, setIsAiVoiceDubbing] = useState(false);
   const [bgVolume, setBgVolume] = useState(0.15); // Background music volume during dubbing
-  const [avatarOn, setAvatarOn] = useState(false); // Talking avatar toggle
+
   const [activeDubbedEl, setActiveDubbedEl] = useState<HTMLAudioElement | null>(null);
   const [voiceVolume, setVoiceVolume] = useState(1.0); // AI voice volume
   const lastSpokenSegmentIdRef = useRef<number | null>(null);
@@ -1205,17 +1204,7 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
           </div>
         )}
 
-        {/* Talking Avatar — lip-syncs with the dubbed voice (or pulses on active segments) */}
-        {avatarOn && (
-          <div className="absolute bottom-2 right-2 z-20">
-            <TalkingAvatar
-              enabled={avatarOn}
-              audioEl={activeDubbedEl}
-              speaking={Boolean(isAiVoiceDubbing && isPlaying && activeSegment)}
-              uiLang={uiLang}
-            />
-          </div>
-        )}
+
 
         {/* Live Subtitle Overlay — draggable to any position in the video */}
         {showSubtitles && displaySegment && (
@@ -1340,21 +1329,7 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
               <span>AI Voice</span>
             </button>
 
-            {/* Talking Avatar Toggle (compact) */}
-            <button
-              id="player-toggle-avatar"
-              type="button"
-              onClick={() => setAvatarOn((v) => !v)}
-              className={`px-2 py-1 sm:px-2.5 sm:py-1.5 rounded-lg text-[11px] sm:text-xs font-semibold flex items-center gap-1 sm:gap-1.5 whitespace-nowrap shrink-0 transition-all ${
-                avatarOn
-                  ? 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-sm ring-1 ring-emerald-400'
-                  : 'text-stone-400 hover:text-white hover:bg-stone-800'
-              }`}
-              title={t.avatarTooltip}
-            >
-              <Bot className={`w-3.5 h-3.5 shrink-0 ${avatarOn ? 'text-emerald-200' : ''}`} />
-              <span>{t.avatarLabel}</span>
-            </button>
+
 
           </div>
 
