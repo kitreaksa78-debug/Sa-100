@@ -1167,7 +1167,8 @@ def _process_video_job(job_id):
             raise RuntimeError("FFmpeg produced no valid output")
 
         now = time.strftime("%Y%m%d-%H%M")
-        filename = "translated-%s-%s.mp4" % (job.get("targetLanguage") or ("video" if has_video else "audio"), now)
+        ext = "m4a" if not has_video else "mp4"
+        filename = "translated-%s-%s.%s" % (job.get("targetLanguage") or ("video" if has_video else "audio"), now, ext)
         _set_job(
             job_id,
             status="done",
@@ -1288,7 +1289,7 @@ def handle_video_process():
 
 
 def handle_video_status():
-    job_id = request.args.get("jobId") or (request.get_json(silent=True) or {}).get("jobId")
+    job_id = _extract_job_id() or request.args.get("jobId") or (request.get_json(silent=True) or {}).get("jobId")
     job = _VIDEO_JOBS.get(job_id)
     if not job:
         return jsonify({"error": "Unknown jobId"}), 404
@@ -1307,7 +1308,7 @@ def handle_video_status():
 
 
 def handle_video_download():
-    job_id = request.args.get("jobId")
+    job_id = _extract_job_id() or request.args.get("jobId")
     job = _VIDEO_JOBS.get(job_id)
     if not job or job.get("status") != "done" or not job.get("outputPath"):
         return jsonify({"error": "Video is not ready yet"}), 404
@@ -1321,6 +1322,63 @@ def handle_video_download():
 
 # ---------------------------------------------------------------- Routing
 
+# --- Canonical endpoint normalization (slash vs hyphen, with id suffix) ---
+_VIDEO_BASES = ["video/capabilities", "video/upload", "video/process", "video/status", "video/download"]
+
+def _canonical_endpoint(raw: str) -> str:
+    s = (raw or "").strip().strip("/").lower()
+    s = s.split("?")[0].split("#")[0]
+    if not s:
+        return s
+    # direct slash base or with id suffix  e.g. video/status/abc123
+    for base in _VIDEO_BASES:
+        if s == base or s.startswith(base + "/"):
+            return base
+    # hyphen/underscore variant  e.g. video-capabilities, video_status
+    for base in _VIDEO_BASES:
+        hy = base.replace("/", "-")
+        us = base.replace("/", "_")
+        if s == hy or s.startswith(hy + "/") or s.startswith(hy + "-"):
+            return base
+        if s == us or s.startswith(us + "/"):
+            return base
+    # substring fallback (proxy header may contain full URL)
+    for base in _VIDEO_BASES:
+        if base in s:
+            return base
+        hy = base.replace("/", "-")
+        if hy in s:
+            return base
+    return s
+
+def _extract_job_id():
+    for k in ("jobId", "job_id", "id", "jobID"):
+        v = request.args.get(k)
+        if v and v.strip():
+            return v.strip()
+    route = (request.args.get("route") or request.args.get("path") or "").strip()
+    if route:
+        m = re.search(r"video[/-](?:status|download)[\/-]([^/?&#]+)", route, re.I)
+        if m:
+            return m.group(1).strip()
+    path = request.path or ""
+    m = re.search(r"video[/-](?:status|download)[\/-]([^/?&#]+)", path, re.I)
+    if m:
+        return m.group(1).strip()
+    qs = request.query_string.decode(errors="ignore") if request.query_string else ""
+    if qs:
+        m = re.search(r"jobId=([^&]+)", qs)
+        if m:
+            return m.group(1).strip()
+    try:
+        body = request.get_json(silent=True) or {}
+        for k in ("jobId", "job_id", "id"):
+            if body.get(k):
+                return str(body.get(k)).strip()
+    except Exception:
+        pass
+    return None
+
 def _endpoint_name():
     """Best-effort resolution of the original endpoint name.
 
@@ -1331,17 +1389,40 @@ def _endpoint_name():
       2. Proxy headers (x-original-url, …) — in case the platform rewrites
          /api/<name> to the function and preserves the original URL there.
       3. The last path segment (e.g. /api/status -> status).
+    Normalizes slash/hyphen and strips jobId suffixes so
+    video/status/<id> and video-status both resolve to video/status.
     """
-    route = (request.args.get("route") or request.args.get("path") or "").strip().strip("/")
-    if route:
-        return route.lower()
+    for key in ("route", "path"):
+        val = (request.args.get(key) or "").strip()
+        if val:
+            canon = _canonical_endpoint(val)
+            if canon in _HANDLERS:
+                return canon
+            # even if not in handlers, if it is a video base, return it
+            for base in _VIDEO_BASES:
+                if canon == base:
+                    return base
+            return canon or val.lower().strip("/").split("?")[0]
     for header in ("x-original-url", "x-forwarded-uri", "x-rewritten-url", "x-original-uri"):
         value = request.headers.get(header)
         if value:
-            return value.rstrip("/").rsplit("/", 1)[-1].lower()
+            canon = _canonical_endpoint(value)
+            if canon in _HANDLERS:
+                return canon
+            m = re.search(r"video[/-](?:capabilities|upload|process|status|download)", value, re.I)
+            if m:
+                canon2 = _canonical_endpoint(m.group(0))
+                if canon2 in _HANDLERS:
+                    return canon2
     path = request.path or ""
+    canon = _canonical_endpoint(path)
+    if canon in _HANDLERS:
+        return canon
     name = path.rstrip("/").rsplit("/", 1)[-1].lower() if path else ""
-    return name
+    norm = re.sub(r"^video[-_]", "video/", name)
+    if norm in _HANDLERS:
+        return norm
+    return canon or name
 
 
 _HANDLERS = {
@@ -1357,10 +1438,15 @@ _HANDLERS = {
     "list-groq-models": handle_list_groq_models,
     "render-mp4": handle_render_mp4,
     "probe-tts": handle_probe_tts,
+    "video/capabilities": handle_video_capabilities,
     "video-capabilities": handle_video_capabilities,
+    "video/upload": handle_video_upload,
     "video-upload": handle_video_upload,
+    "video/process": handle_video_process,
     "video-process": handle_video_process,
+    "video/status": handle_video_status,
     "video-status": handle_video_status,
+    "video/download": handle_video_download,
     "video-download": handle_video_download,
 }
 
@@ -1381,7 +1467,14 @@ def dispatch(_path):
             ),
             404,
         )
-    if name in ("status", "check-groq-keys", "check-gemini-keys", "list-groq-models", "probe-model", "probe-tts", "video-capabilities", "video-status", "video-download"):
+    # GET-only endpoints (support both slash and hyphen canonical forms)
+    _GET_ONLY = {
+        "status", "check-groq-keys", "check-gemini-keys", "list-groq-models", "probe-model", "probe-tts",
+        "video/capabilities", "video-capabilities",
+        "video/status", "video-status",
+        "video/download", "video-download",
+    }
+    if name in _GET_ONLY:
         if request.method != "GET":
             return jsonify({"error": "Method not allowed"}), 405
     elif request.method != "POST":
