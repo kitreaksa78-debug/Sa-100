@@ -2,14 +2,16 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   AlertCircle,
   Sparkles,
-  Layers,
   KeyRound,
   FileVideo,
   CheckCircle,
   HelpCircle,
-  ShieldAlert,
   Film,
   Download,
+  ArrowRight,
+  ArrowLeft,
+  Wand2,
+  ScanSearch,
 } from 'lucide-react';
 import { Header } from './components/Header';
 import { WelcomePage } from './components/WelcomePage';
@@ -19,12 +21,13 @@ import { OptionsBar } from './components/OptionsBar';
 import { MediaPlayer, MediaPlayerHandle } from './components/MediaPlayer';
 import { TranscriptView } from './components/TranscriptView';
 import { ExportToolbar } from './components/ExportToolbar';
+import { WorkflowSteps, WorkflowStepId } from './components/WorkflowSteps';
 import { UILang, UI_TEXT } from './data/translations';
 import { SubtitleSegment, TranscriptionResult, ServerStatus } from './types';
 import { LANGUAGES, SampleMedia } from './data/languages';
 import { exportToSrt, exportToVtt } from './utils/subtitleUtils';
 import { apiUrl } from './utils/api';
-import { exportEditedMp4ServerSide } from './utils/mp4Job';
+import { exportEditedMp4ServerSide, exportEditedMp4Shotstack } from './utils/mp4Job';
 import { shrinkMediaToAudio } from './utils/mediaCompress';
 import { extractVocalEmphasizedAudio } from './utils/vocalSeparation';
 import { recordUsage } from './utils/usageTracker';
@@ -117,8 +120,23 @@ export default function App() {
   const [dubbingProgress, setDubbingProgress] = useState<number>(0);
   const [dubbingTotal, setDubbingTotal] = useState<number>(0);
   const [muteOriginal, setMuteOriginal] = useState(false);
+  // Segment-level AI voice regeneration (Edit step)
+  const [isRedubbingId, setIsRedubbingId] = useState<number | null>(null);
+
   // Smart export: strip the original voice, keep only music + translated voice.
   const [removeVocalsOnExport, setRemoveVocalsOnExport] = useState(true);
+
+  // AI Video Editor workflow — step state
+  const [activeStep, setActiveStep] = useState<WorkflowStepId>(1);
+  const [maxReached, setMaxReached] = useState<WorkflowStepId>(1);
+
+  // Audio mix defaults (applied automatically to the server render)
+  const [voiceVolume, setVoiceVolume] = useState(1.0); // 0..2
+  const [bgVolume, setBgVolume] = useState(0.15); // 0..1
+  const [duckDepth, setDuckDepth] = useState<'light' | 'normal' | 'deep'>('normal');
+
+  // Render provider: 'shotstack' = Shotstack cloud (sandbox key), 'ffmpeg' = server FFmpeg.
+  const [renderProvider, setRenderProvider] = useState<'ffmpeg' | 'shotstack'>('shotstack');
 
   // Server-side MP4 generation state (real FFmpeg job — no browser recording)
   const [isExportingDubbed, setIsExportingDubbed] = useState(false);
@@ -144,19 +162,6 @@ export default function App() {
     if (!exportedResult) return;
     // Server-generated MP4: navigate straight to the real file URL so the
     // browser downloads the actual .mp4 produced by FFmpeg.
-    if (exportedResult.isServerMp4) {
-      const a = document.createElement('a');
-      a.href = exportedResult.url;
-      a.download = exportedResult.filename;
-      a.style.display = 'none';
-      a.rel = 'noopener';
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => {
-        document.body.removeChild(a);
-      }, 200);
-      return;
-    }
     const a = document.createElement('a');
     a.href = exportedResult.url;
     a.download = exportedResult.filename;
@@ -164,7 +169,6 @@ export default function App() {
     a.rel = 'noopener';
     document.body.appendChild(a);
     a.click();
-    // Delay removal so the browser has time to start the download
     setTimeout(() => {
       document.body.removeChild(a);
     }, 200);
@@ -196,6 +200,31 @@ export default function App() {
 
   const isGroqActive = Boolean(serverStatus.groqConfigured || groqKey.trim());
 
+  // --- Workflow gating ---
+  const hasMedia = Boolean(selectedFile || mediaPreviewUrl);
+  const hasDubbedAudio = Boolean(result && result.segments.some((s) => s.dubbedAudioBase64));
+
+  useEffect(() => {
+    if (hasMedia && maxReached < 2) setMaxReached(2);
+  }, [hasMedia, maxReached]);
+
+  useEffect(() => {
+    if (result && maxReached < 2) setMaxReached(2);
+  }, [result, maxReached]);
+
+  useEffect(() => {
+    if (hasDubbedAudio && maxReached < 3) setMaxReached(3);
+  }, [hasDubbedAudio, maxReached]);
+
+  // Push mix-console levels into the live player whenever they change.
+  useEffect(() => {
+    mediaPlayerHandleRef.current?.setMixLevels(voiceVolume, bgVolume, duckDepth);
+  }, [voiceVolume, bgVolume, duckDepth]);
+
+  const goToStep = (step: WorkflowStepId) => {
+    if (step <= maxReached) setActiveStep(step);
+  };
+
   // Handle selecting a pre-bundled sample media
   const handleSelectSample = (sample: SampleMedia) => {
     setSelectedFile(null);
@@ -218,6 +247,97 @@ export default function App() {
       vttOriginal,
       vttTranslated,
     });
+    // A sample already carries a complete analyzed result → jump to the analyzer.
+    setActiveStep(2);
+  };
+
+  // Recompute derived transcript strings after any segment edit.
+  const rebuildResult = (segments: SubtitleSegment[]) => {
+    if (!result) return;
+    setResult({
+      ...result,
+      segments,
+      fullOriginalText: segments.map((s) => s.originalText).join(' '),
+      fullTranslatedText: segments.map((s) => s.translatedText).join(' '),
+      srtOriginal: exportToSrt(segments, false),
+      srtTranslated: exportToSrt(segments, true),
+      vttOriginal: exportToVtt(segments, false),
+      vttTranslated: exportToVtt(segments, true),
+    });
+  };
+
+  // --- Video editor segment operations (all real, all feed the render) ---
+
+  const handleDeleteSegment = (segId: number) => {
+    if (!result) return;
+    rebuildResult(result.segments.filter((s) => s.id !== segId));
+  };
+
+  const handleSplitSegment = (segId: number, atTime: number) => {
+    if (!result) return;
+    const seg = result.segments.find((s) => s.id === segId);
+    if (!seg || atTime <= seg.start + 0.3 || atTime >= seg.end - 0.3) return;
+    const nextId = Math.max(0, ...result.segments.map((s) => s.id)) + 1;
+    const first = { ...seg, end: atTime, dubbedAudioBase64: undefined };
+    const second = { ...seg, id: nextId, start: atTime, dubbedAudioBase64: undefined };
+    const updated = [...result.segments];
+    updated.splice(
+      updated.findIndex((s) => s.id === segId),
+      1,
+      first,
+      second
+    );
+    rebuildResult(updated);
+  };
+
+  const handleUpdateSegmentTimes = (segId: number, start: number, end: number) => {
+    if (!result) return;
+    rebuildResult(result.segments.map((s) => (s.id === segId ? { ...s, start, end } : s)));
+  };
+
+  // Regenerate the AI voice for ONE segment (real backend TTS call).
+  const handleRedubSegment = async (segId: number) => {
+    if (!result || isRedubbingId !== null) return;
+    if (!isGroqActive) {
+      setIsApiKeyModalOpen(true);
+      return;
+    }
+    const seg = result.segments.find((s) => s.id === segId);
+    if (!seg || !seg.translatedText.trim()) return;
+
+    setIsRedubbingId(segId);
+    setErrorMessage(null);
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (groqKey.trim()) headers['x-groq-api-key'] = groqKey.trim();
+      const res = await fetch(apiUrl('batch-tts'), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ segments: [seg], language: result.targetLanguage }),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || 'Failed to generate AI voice');
+      }
+      const data = await res.json();
+      if (data.fallback) {
+        throw new Error('No API keys available for TTS generation');
+      }
+      const audioData = data.audio.find((a: any) => a.id === segId);
+      if (!audioData?.audio) {
+        throw new Error('TTS returned no audio for this segment');
+      }
+      rebuildResult(
+        result.segments.map((s) =>
+          s.id === segId ? { ...s, dubbedAudioBase64: audioData.audio } : s
+        )
+      );
+    } catch (err: any) {
+      console.error('Re-dub error:', err);
+      setErrorMessage(err.message || 'Error generating AI voice');
+    } finally {
+      setIsRedubbingId(null);
+    }
   };
 
   // Perform AI Transcription & Translation
@@ -563,13 +683,14 @@ export default function App() {
   // Export the dubbed video file.
   // 1) Preferred: server-side FFmpeg job — the original video is uploaded,
   //    the translated AI voice clips are scheduled onto the timeline, mixed
-  //    with the preserved background audio and muxed into a real H.264+AAC
-  //    MP4 (video stream copied whenever possible). No browser recording.
+  //    with the preserved background audio (mix-console levels applied) and
+  //    muxed into a real H.264+AAC MP4 (video stream copied whenever
+  //    possible). No browser recording.
   // 2) Fallback (serverless deploys without ffmpeg): legacy client-side
   //    MediaRecorder export, only when the server pipeline is unavailable.
   const handleExportDubbed = async () => {
     if (isExportingDubbed) return;
-    if (!result?.segments.some((s) => s.dubbedAudioBase64)) {
+    if (!result?.segments.some((s) => s.translatedText?.trim())) {
       setErrorMessage(t.exportDubbedFailed);
       return;
     }
@@ -580,15 +701,37 @@ export default function App() {
     setErrorMessage(null);
 
     try {
-      const serverResult = await exportEditedMp4ServerSide(result, {
-        selectedFile,
-        mediaPreviewUrl,
-        mediaType,
-        targetLanguage: result.targetLanguage,
-        removeVocals: removeVocalsOnExport,
-        setExportStep,
-        setExportProgress: (p) => setExportProgress(p),
-      });
+      let serverResult = null;
+      if (renderProvider === 'shotstack') {
+        // Preferred: Shotstack cloud render (sandbox key — watermark + 10min cap).
+        serverResult = await exportEditedMp4Shotstack(result, {
+          selectedFile,
+          mediaPreviewUrl,
+          mediaType,
+          targetLanguage: result.targetLanguage,
+          removeVocals: removeVocalsOnExport,
+          voiceGain: voiceVolume,
+          bgGain: bgVolume,
+          duckDepth,
+          setExportStep,
+          setExportProgress: (p) => setExportProgress(p),
+        });
+      }
+      if (!serverResult) {
+        // Fallback / default: server-side FFmpeg job.
+        serverResult = await exportEditedMp4ServerSide(result, {
+          selectedFile,
+          mediaPreviewUrl,
+          mediaType,
+          targetLanguage: result.targetLanguage,
+          removeVocals: removeVocalsOnExport,
+          voiceGain: voiceVolume,
+          bgGain: bgVolume,
+          duckDepth,
+          setExportStep,
+          setExportProgress: (p) => setExportProgress(p),
+        });
+      }
       if (serverResult) {
         setExportedResult((prev) => {
           if (prev && !prev.isServerMp4) URL.revokeObjectURL(prev.url);
@@ -630,24 +773,7 @@ export default function App() {
 
   // Update segments after user inline edits
   const handleUpdateSegments = (updated: SubtitleSegment[]) => {
-    if (!result) return;
-    const fullTrans = updated.map((s) => s.translatedText).join(' ');
-    const fullOrig = updated.map((s) => s.originalText).join(' ');
-    const srtTrans = exportToSrt(updated, true);
-    const srtOrig = exportToSrt(updated, false);
-    const vttTrans = exportToVtt(updated, true);
-    const vttOrig = exportToVtt(updated, false);
-
-    setResult({
-      ...result,
-      segments: updated,
-      fullTranslatedText: fullTrans,
-      fullOriginalText: fullOrig,
-      srtTranslated: srtTrans,
-      srtOriginal: srtOrig,
-      vttTranslated: vttTrans,
-      vttOriginal: vttOrig,
-    });
+    rebuildResult(updated);
   };
 
   // Welcome page shown to signed-out visitors; "Get started" connects with Google.
@@ -674,7 +800,13 @@ export default function App() {
 
       {/* Main Workspace */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 space-y-6">
-        {/* No API key banner needed - keys are configured via environment */}
+        {/* Workflow stepper */}
+        <WorkflowSteps
+          uiLang={uiLang}
+          active={activeStep}
+          maxReached={maxReached}
+          onSelect={goToStep}
+        />
 
         {/* Error notification */}
         {errorMessage && (
@@ -693,77 +825,319 @@ export default function App() {
           </div>
         )}
 
-        {/* Media Input Component */}
-        <MediaUploader
-          uiLang={uiLang}
-          selectedFile={selectedFile}
-          onSelectFile={(f) => {
-            setSelectedFile(f);
-            setResult(null);
-            setErrorMessage(null);
-            clearExportedResult();
-          }}
-          mediaPreviewUrl={mediaPreviewUrl}
-          setMediaPreviewUrl={setMediaPreviewUrl}
-          mediaType={mediaType}
-          setMediaType={setMediaType}
-          onSelectSample={handleSelectSample}
-          disabled={isProcessing}
-        />
-
-        {/* Model & Language Options Bar */}
-        <OptionsBar
-          uiLang={uiLang}
-          sourceLang={sourceLang}
-          setSourceLang={setSourceLang}
-          targetLang={targetLang}
-          setTargetLang={setTargetLang}
-          whisperModel={whisperModel}
-          setWhisperModel={setWhisperModel}
-          translationModel={translationModel}
-          setTranslationModel={setTranslationModel}
-          onTranscribeAndTranslate={handleTranscribeAndTranslate}
-          isProcessing={isProcessing}
-          canProcess={Boolean(selectedFile || mediaPreviewUrl)}
-          userId={user?.sub}
-        />
-
-        {/* Processing Indicator */}
-        {isProcessing && (
-          <div className="p-6 rounded-2xl bg-white border border-stone-200 text-center shadow-xs space-y-3">
-            <div className="w-10 h-10 mx-auto rounded-full bg-orange-100 text-orange-600 flex items-center justify-center animate-spin">
-              <Sparkles className="w-5 h-5" />
+        {/* ============ STEP 1: UPLOAD ============ */}
+        {activeStep === 1 && (
+          <div className="space-y-4 animate-fade-in">
+            <div className="flex items-center gap-2.5">
+              <span className="w-9 h-9 rounded-xl bg-gradient-to-br from-orange-500 to-amber-500 text-white flex items-center justify-center shadow-md shadow-orange-500/25 shrink-0">
+                <FileVideo className="w-5 h-5" />
+              </span>
+              <div>
+                <h2 className="text-sm font-bold text-stone-900">{t.wfUploadLong}</h2>
+                <p className="text-[11px] text-stone-500">{t.dropSub}</p>
+              </div>
             </div>
-            <h3 className="text-sm font-bold text-stone-800">{t.processing}</h3>
-            <p className="text-xs text-stone-500 font-medium">
-              {processingStep || t.processingStep1}
-            </p>
+
+            <MediaUploader
+              uiLang={uiLang}
+              selectedFile={selectedFile}
+              onSelectFile={(f) => {
+                setSelectedFile(f);
+                setResult(null);
+                setErrorMessage(null);
+                clearExportedResult();
+                setActiveStep(1);
+                setMaxReached(1);
+              }}
+              mediaPreviewUrl={mediaPreviewUrl}
+              setMediaPreviewUrl={setMediaPreviewUrl}
+              mediaType={mediaType}
+              setMediaType={setMediaType}
+              onSelectSample={handleSelectSample}
+              disabled={isProcessing}
+            />
+
+            <div className="flex justify-end">
+              <button
+                id="step1-next-btn"
+                type="button"
+                disabled={!hasMedia}
+                onClick={() => goToStep(2)}
+                className="inline-flex items-center gap-2 px-6 py-2.5 rounded-xl text-sm font-bold bg-gradient-to-r from-orange-600 to-amber-500 text-white shadow-md shadow-orange-500/25 hover:from-orange-700 hover:to-amber-600 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {t.wfAnalyze}
+                <ArrowRight className="w-4 h-4" />
+              </button>
+            </div>
           </div>
         )}
 
-        {/* Results Area */}
-        {result && (
-          <div className="space-y-6 animate-in fade-in duration-300">
-            {/* Top Export & Action Toolbar */}
-            <ExportToolbar
-              result={result}
-              onRetranslate={handleRetranslate}
-              isRetranslating={isRetranslating}
+        {/* ============ STEP 2: ANALYZE & TRANSLATE ============ */}
+        {activeStep === 2 && (
+          <div className="space-y-4 animate-fade-in">
+            <div className="flex items-center gap-2.5">
+              <span className="w-9 h-9 rounded-xl bg-gradient-to-br from-amber-500 to-orange-600 text-white flex items-center justify-center shadow-md shadow-amber-500/25 shrink-0">
+                <ScanSearch className="w-5 h-5" />
+              </span>
+              <div>
+                <h2 className="text-sm font-bold text-stone-900">{t.wfAnalyzeLong}</h2>
+                <p className="text-[11px] text-stone-500">{t.processingStep1}</p>
+              </div>
+            </div>
+
+            <OptionsBar
               uiLang={uiLang}
-              mediaType={mediaType}
-              onGenerateDubbing={handleGenerateDubbing}
-              isGeneratingDubbing={isGeneratingDubbing}
-              dubbingProgress={dubbingProgress}
-              dubbingTotal={dubbingTotal}
-              onExportDubbed={handleExportDubbed}
-              isExportingDubbed={isExportingDubbed}
-              exportProgress={exportProgress}
-              exportStep={exportStep}
-              removeVocalsOnExport={removeVocalsOnExport}
-              setRemoveVocalsOnExport={setRemoveVocalsOnExport}
+              sourceLang={sourceLang}
+              setSourceLang={setSourceLang}
+              targetLang={targetLang}
+              setTargetLang={setTargetLang}
+              whisperModel={whisperModel}
+              setWhisperModel={setWhisperModel}
+              translationModel={translationModel}
+              setTranslationModel={setTranslationModel}
+              onTranscribeAndTranslate={handleTranscribeAndTranslate}
+              isProcessing={isProcessing}
+              canProcess={Boolean(selectedFile || mediaPreviewUrl)}
+              userId={user?.sub}
             />
 
-            {/* AI-Rendered Media Preview (watch/listen to the final dubbed file & download) */}
+            {/* Processing Indicator */}
+            {isProcessing && (
+              <div className="p-6 rounded-2xl bg-white border border-stone-200 text-center shadow-xs space-y-3">
+                <div className="w-10 h-10 mx-auto rounded-full bg-orange-100 text-orange-600 flex items-center justify-center animate-spin">
+                  <Sparkles className="w-5 h-5" />
+                </div>
+                <h3 className="text-sm font-bold text-stone-800">{t.processing}</h3>
+                <p className="text-xs text-stone-500 font-medium">
+                  {processingStep || t.processingStep1}
+                </p>
+              </div>
+            )}
+
+            {/* Analysis summary */}
+            {result && !isProcessing && (
+              <div className="bg-white rounded-2xl border border-emerald-200/80 shadow-sm shadow-emerald-100/50 p-5 space-y-4">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div className="flex items-center gap-2.5">
+                    <span className="w-9 h-9 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
+                      <CheckCircle className="w-5 h-5" />
+                    </span>
+                    <div>
+                      <h3 className="text-sm font-bold text-stone-900">{t.analyzeReadyTitle}</h3>
+                      <p className="text-[11px] text-stone-500">{t.analyzeReadySub}</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      id="analyze-retry-btn"
+                      type="button"
+                      onClick={handleTranscribeAndTranslate}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-semibold border border-stone-200 bg-stone-50 text-stone-700 hover:bg-stone-100 transition-all"
+                    >
+                      <Wand2 className="w-3.5 h-3.5" />
+                      {t.analyzeRetry}
+                    </button>
+                    <button
+                      id="analyze-next-btn"
+                      type="button"
+                      onClick={() => goToStep(3)}
+                      className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-xl text-xs font-bold bg-stone-900 text-white hover:bg-stone-800 transition-all"
+                    >
+                      {t.wfRender}
+                      <ArrowRight className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Badges */}
+                <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-stone-100 text-stone-700 text-xs font-semibold">
+                    {t.detectedLangBadge}:{' '}
+                    <strong className="text-stone-900 uppercase">{result.detectedLanguage}</strong>
+                  </span>
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-orange-100 text-orange-800 text-xs font-semibold">
+                    {t.targetLangLabel}:{' '}
+                    <strong className="text-orange-950">{result.targetLanguageName || result.targetLanguage}</strong>
+                  </span>
+                  {result.duration > 0 && (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-stone-100 text-stone-600 text-xs font-mono">
+                      {t.durationBadge}: {result.duration.toFixed(1)}s
+                    </span>
+                  )}
+                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-stone-100 text-stone-600 text-xs font-mono">
+                    {t.analyzeSegmentsLabel}: {result.segments.length}
+                  </span>
+                  {result.processingTimeMs > 0 && (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-700 text-xs font-mono border border-emerald-200">
+                      ⚡ {(result.processingTimeMs / 1000).toFixed(2)}s
+                    </span>
+                  )}
+                  <span
+                    className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold border ${
+                      hasDubbedAudio
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                        : 'bg-amber-50 text-amber-700 border-amber-200'
+                    }`}
+                  >
+                    {t.analyzeVoiceState}: {hasDubbedAudio ? t.analyzeVoiceReady : t.analyzeVoicePending}
+                  </span>
+                </div>
+
+              </div>
+            )}
+
+            {/* AI Voice + Transcript editor — merged from old Edit step */}
+            {result && !isProcessing && (
+              <div className="space-y-4">
+                <ExportToolbar
+                  result={result}
+                  onRetranslate={handleRetranslate}
+                  isRetranslating={isRetranslating}
+                  uiLang={uiLang}
+                  mediaType={mediaType}
+                  onGenerateDubbing={handleGenerateDubbing}
+                  isGeneratingDubbing={isGeneratingDubbing}
+                  dubbingProgress={dubbingProgress}
+                  dubbingTotal={dubbingTotal}
+                  onExportDubbed={handleExportDubbed}
+                  isExportingDubbed={isExportingDubbed}
+                  exportProgress={exportProgress}
+                  exportStep={exportStep}
+                  removeVocalsOnExport={removeVocalsOnExport}
+                  setRemoveVocalsOnExport={setRemoveVocalsOnExport}
+                  mode="edit"
+                />
+                <TranscriptView
+                  segments={result.segments}
+                  onUpdateSegments={handleUpdateSegments}
+                  currentTime={currentTime}
+                  onSeek={handleSeek}
+                  uiLang={uiLang}
+                  targetLangCode={result.targetLanguage}
+                  onDeleteSegment={handleDeleteSegment}
+                  onSplitSegment={handleSplitSegment}
+                  onUpdateSegmentTimes={handleUpdateSegmentTimes}
+                  onRedubSegment={handleRedubSegment}
+                  isRedubbingId={isRedubbingId}
+                />
+              </div>
+            )}
+
+            <div className="flex justify-between">
+              <button
+                type="button"
+                onClick={() => goToStep(1)}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold text-stone-600 hover:bg-stone-100 transition-all"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" />
+                {t.stepBack}
+              </button>
+              <button
+                id="step2-next-btn"
+                type="button"
+                disabled={!result}
+                onClick={() => goToStep(3)}
+                className="inline-flex items-center gap-2 px-6 py-2.5 rounded-xl text-sm font-bold bg-gradient-to-r from-orange-600 to-amber-500 text-white shadow-md shadow-orange-500/25 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {t.wfRender}
+                <ArrowRight className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        )}
+
+
+
+        {/* ============ STEP 3: RENDER & DOWNLOAD ============ */}
+        {activeStep === 3 && result && (
+          <div className="space-y-4 animate-fade-in">
+            <div className="flex items-center gap-2.5">
+              <span className="w-9 h-9 rounded-xl bg-gradient-to-br from-rose-500 to-orange-500 text-white flex items-center justify-center shadow-md shadow-rose-500/25 shrink-0">
+                <Film className="w-5 h-5" />
+              </span>
+              <div>
+                <h2 className="text-sm font-bold text-stone-900">{t.wfRenderLong}</h2>
+                <p className="text-[11px] text-stone-500">{t.renderHint}</p>
+              </div>
+            </div>
+
+            {/* Render provider selector */}
+            <div className="bg-white rounded-2xl border border-stone-200/80 shadow-sm shadow-stone-200/50 p-4 sm:p-5">
+              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-xs font-bold text-stone-800">{t.renderProvider}</h3>
+                  <p className="text-[11px] text-stone-500 mt-0.5">{t.renderProviderHint}</p>
+                </div>
+                <div className="flex items-center gap-1 bg-stone-100 p-1 rounded-xl">
+                  <button
+                    id="render-provider-ffmpeg"
+                    type="button"
+                    onClick={() => setRenderProvider('ffmpeg')}
+                    className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                      renderProvider === 'ffmpeg'
+                        ? 'bg-white text-stone-900 shadow-xs'
+                        : 'text-stone-600 hover:text-stone-900'
+                    }`}
+                  >
+                    {t.renderFfmpeg}
+                  </button>
+                  <button
+                    id="render-provider-shotstack"
+                    type="button"
+                    onClick={() => setRenderProvider('shotstack')}
+                    className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                      renderProvider === 'shotstack'
+                        ? 'bg-white text-stone-900 shadow-xs'
+                        : 'text-stone-600 hover:text-stone-900'
+                    }`}
+                  >
+                    {t.renderShotstack}
+                  </button>
+                </div>
+              </div>
+              {renderProvider === 'shotstack' && (
+                <p className="mt-3 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-[11px] text-amber-800 leading-relaxed">
+                  ⚠️ {t.shotstackSandboxNote}
+                </p>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <ExportToolbar
+                result={result}
+                onRetranslate={handleRetranslate}
+                isRetranslating={isRetranslating}
+                uiLang={uiLang}
+                mediaType={mediaType}
+                onGenerateDubbing={handleGenerateDubbing}
+                isGeneratingDubbing={isGeneratingDubbing}
+                dubbingProgress={dubbingProgress}
+                dubbingTotal={dubbingTotal}
+                onExportDubbed={handleExportDubbed}
+                isExportingDubbed={isExportingDubbed}
+                exportProgress={exportProgress}
+                exportStep={exportStep}
+                removeVocalsOnExport={removeVocalsOnExport}
+                setRemoveVocalsOnExport={setRemoveVocalsOnExport}
+                mode="render"
+              />
+
+              {/* Keep the player mounted so the browser fallback exporter works */}
+              <MediaPlayer
+                ref={mediaPlayerHandleRef}
+                mediaUrl={mediaPreviewUrl}
+                mediaType={mediaType}
+                segments={result.segments}
+                currentTime={currentTime}
+                setCurrentTime={setCurrentTime}
+                mediaPlayerRef={mediaPlayerRef}
+                targetLangCode={result.targetLanguage}
+                uiLang={uiLang}
+                muteOriginal={muteOriginal}
+                setMuteOriginal={setMuteOriginal}
+                removeVocalsOnExport={removeVocalsOnExport}
+              />
+            </div>            {/* AI-Rendered Media Preview (watch/listen to the final dubbed file & download) */}
             {exportedResult && (
               <div className="bg-white rounded-2xl border border-indigo-200 shadow-xs p-4 sm:p-5 space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-3">
@@ -822,62 +1196,64 @@ export default function App() {
                 </p>
               </div>
             )}
-
-            {/* Split Screen: Media Player + Interactive Transcript View */}
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-              {/* Media Player Column */}
-              <div className="lg:col-span-6 space-y-4">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-xs font-bold text-stone-700 uppercase tracking-wider">
-                    {t.videoPlayerTitle}
-                  </h3>
-                  <span className="text-[11px] text-stone-500 font-medium">
-                    {result.segments.length} Subtitle Lines
-                  </span>
-                </div>
-
-                <MediaPlayer
-                  ref={mediaPlayerHandleRef}
-                  mediaUrl={mediaPreviewUrl}
-                  mediaType={mediaType}
-                  segments={result.segments}
-                  currentTime={currentTime}
-                  setCurrentTime={setCurrentTime}
-                  mediaPlayerRef={mediaPlayerRef}
-                  targetLangCode={result.targetLanguage}
-                  uiLang={uiLang}
-                  muteOriginal={muteOriginal}
-                  setMuteOriginal={setMuteOriginal}
-                  removeVocalsOnExport={removeVocalsOnExport}
-                />
-              </div>
-
-              {/* Interactive Subtitle & Transcript Column */}
-              <div className="lg:col-span-6 space-y-4">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-xs font-bold text-stone-700 uppercase tracking-wider">
-                    {t.resultsTitle}
-                  </h3>
-                  <span className="text-[11px] text-stone-500 font-medium">
-                    Interactive Timestamps
-                  </span>
-                </div>
-
-                <TranscriptView
-                  segments={result.segments}
-                  onUpdateSegments={handleUpdateSegments}
-                  currentTime={currentTime}
-                  onSeek={handleSeek}
-                  uiLang={uiLang}
-                  targetLangCode={result.targetLanguage}
-                />
-              </div>
+            <div className="mt-2 flex justify-between">
+              <button
+                type="button"
+                onClick={() => goToStep(2)}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold text-stone-600 hover:bg-stone-100 transition-all"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" />
+                {t.stepBack}
+              </button>
+              {!hasDubbedAudio && (
+                <button
+                  type="button"
+                  onClick={() => goToStep(2)}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 transition-all"
+                >
+                  <KeyRound className="w-3.5 h-3.5" />
+                  {t.generateAiVoice}
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </button>
+              )}
+              {hasDubbedAudio && (
+                <button
+                  type="button"
+                  id="step3-primary-download-btn"
+                  onClick={() => {
+                    if (renderProvider === 'shotstack') {
+                      void handleExportDubbed()
+                      return
+                    }
+                    const btn = document.querySelector('#export-dubbed-video-btn') as HTMLButtonElement | null
+                    if (btn) btn.click()
+                  }}
+                  className="flex items-center gap-1.5 rounded-xl bg-gradient-to-r from-rose-600 to-orange-500 px-5 py-2.5 text-sm font-bold text-white shadow-lg shadow-rose-500/20 hover:from-rose-500 hover:to-orange-400 transition-all active:scale-[0.98]"
+                >
+                  {t.wfRender}
+                  <Download className="mr-1.5 w-4 h-4" />
+                </button>
+              )}
             </div>
           </div>
         )}
+
+        {/* No result yet in mix/render steps — guidance card */}
+        {activeStep >= 2 && !result && (
+          <div className="p-8 rounded-2xl bg-white border border-stone-200 text-center shadow-xs space-y-3">
+            <HelpCircle className="w-10 h-10 mx-auto text-stone-300" />
+            <h3 className="text-sm font-bold text-stone-800">{t.noMediaLoaded}</h3>
+            <button
+              type="button"
+              onClick={() => goToStep(1)}
+              className="inline-flex items-center gap-2 px-5 py-2 rounded-xl text-sm font-semibold bg-stone-900 text-white hover:bg-stone-800 transition-all"
+            >
+              {t.wfUpload}
+              <ArrowRight className="w-4 h-4" />
+            </button>
+          </div>
+        )}
       </main>
-
-
     </div>
   );
 }
