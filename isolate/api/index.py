@@ -673,9 +673,11 @@ def handle_batch_tts():
     if not segments or not isinstance(segments, list) or len(segments) == 0:
         return jsonify({"error": "No segments provided"}), 400
 
+    # Edge TTS + Google TTS are free and don't need a Groq key. Only the
+    # Groq Orpheus fallback (English) uses Groq keys, so don't reject the
+    # request early when Groq keys are missing — Khmer/12+ languages still
+    # work via Edge/Google.
     tts_keys = get_groq_keys()
-    if not tts_keys:
-        return jsonify({"audio": [], "fallback": True})
 
     results = []
     for seg in segments:
@@ -1227,7 +1229,9 @@ def handle_video_upload():
             part_path = os.path.join(job["dir"], "part_%06d" % index)
             with open(part_path, "wb") as f:
                 f.write(data)
-            job.setdefault("parts", []).append(index)
+            parts = job.setdefault("parts", [])
+            if index not in parts:
+                parts.append(index)
             return jsonify({"jobId": job_id, "received": index})
         if mode == "finish":
             parts = sorted(job.get("parts") or [])

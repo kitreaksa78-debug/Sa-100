@@ -813,11 +813,9 @@ app.post("/api/batch-tts", express.json(), async (req, res) => {
     return;
   }
 
+  // Edge TTS + Google TTS are free and don't need Groq keys. Only Groq
+  // Orpheus (English) uses Groq keys, so keep working when Groq is missing.
   const ttsKeys = getAllGroqKeys(req);
-  if (ttsKeys.length === 0) {
-    res.status(200).json({ audio: [], fallback: true });
-    return;
-  }
 
   const results: { id: number; start: number; end: number; audio: string }[] = [];
 
