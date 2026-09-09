@@ -1174,14 +1174,23 @@ def _process_video_job(job_id):
             return a
 
         can_copy = info["vcodec"] == "h264" and info["vpix"] in ("yuv420p", "yuvj420p")
+        ffmpeg_bin = _ffmpeg_exe() or "ffmpeg"
         try:
             if can_copy:
-                subprocess.run([_ffmpeg_exe()] + build_args(True), capture_output=True, timeout=1200)
+                result = subprocess.run([ffmpeg_bin] + build_args(True), capture_output=True, timeout=1200)
+                if result.returncode != 0:
+                    err_msg = (result.stderr or b"").decode(errors="ignore")[-500:]
+                    print("[VideoJobs] FFmpeg copy failed (code %d): %s" % (result.returncode, err_msg))
+                    raise RuntimeError("FFmpeg copy failed: %s" % err_msg[:200])
             else:
                 raise RuntimeError("re-encode required")
         except Exception:
             _set_job(job_id, progress=60, message="Rendering MP4 (re-encoding video)")
-            subprocess.run([_ffmpeg_exe()] + build_args(False), capture_output=True, timeout=1200)
+            result = subprocess.run([ffmpeg_bin] + build_args(False), capture_output=True, timeout=1200)
+            if result.returncode != 0:
+                err_msg = (result.stderr or b"").decode(errors="ignore")[-500:]
+                print("[VideoJobs] FFmpeg re-encode failed (code %d): %s" % (result.returncode, err_msg))
+                raise RuntimeError("FFmpeg render failed: %s" % err_msg[:200])
 
         if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
             raise RuntimeError("FFmpeg produced no valid output")
