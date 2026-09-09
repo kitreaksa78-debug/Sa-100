@@ -658,10 +658,6 @@ app.post("/api/batch-tts", import_express.default.json(), async (req, res) => {
     return;
   }
   const ttsKeys = getAllGroqKeys(req);
-  if (ttsKeys.length === 0) {
-    res.status(200).json({ audio: [], fallback: true });
-    return;
-  }
   const results = [];
   for (const seg of segments) {
     if (!seg.translatedText?.trim()) continue;
@@ -958,12 +954,32 @@ async function processVideoJob(jobId) {
         cond ? `[bg0]volume='if(${cond}>=1,0.45,1)':eval=frame[bg]` : "[bg0]anull[bg]"
       );
     }
+    const buildAtempo = (rate) => {
+      if (Math.abs(rate - 1) < 0.015) return "";
+      const parts = [];
+      let r = rate;
+      let guard = 0;
+      while (r > 2 && guard < 6) {
+        parts.push("atempo=2.0");
+        r /= 2;
+        guard++;
+      }
+      while (r < 0.5 && guard < 6) {
+        parts.push("atempo=0.5");
+        r /= 0.5;
+        guard++;
+      }
+      parts.push(`atempo=${r.toFixed(4)}`);
+      return "," + parts.join(",");
+    };
     clips.forEach((c, i) => {
       const segDur = Math.max(c.end - c.start, 0.4);
-      const rate = Math.min(Math.max(c.duration / segDur, 0.85), 2);
+      const rawRate = c.duration / segDur;
+      const clampedRate = Math.min(Math.max(rawRate, 0.5), 4);
       const delayMs = Math.max(0, Math.round(c.start * 1e3));
       let chain = "aformat=channel_layouts=stereo";
-      if (Math.abs(rate - 1) > 0.02) chain += `,atempo=${rate.toFixed(3)}`;
+      chain += buildAtempo(clampedRate);
+      chain += `,aresample=48000:async=1:min_hard_comp=0.100000,apad,atrim=start=0:duration=${segDur.toFixed(3)}`;
       chain += `,adelay=${delayMs}|${delayMs}:all=1`;
       filters.push(`[${i + 1}:a]${chain}[v${i}]`);
     });

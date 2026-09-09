@@ -1105,13 +1105,31 @@ def _process_video_job(job_id):
             else:
                 filters.append("[bg0]anull[bg]")
 
+        def _build_atempo_chain(rate):
+            if abs(rate - 1) < 0.015:
+                return ""
+            parts = []
+            r = rate
+            guard = 0
+            while r > 2.0 and guard < 6:
+                parts.append("atempo=2.0")
+                r /= 2.0
+                guard += 1
+            while r < 0.5 and guard < 6:
+                parts.append("atempo=0.5")
+                r /= 0.5
+                guard += 1
+            parts.append("atempo=%.4f" % r)
+            return "," + ",".join(parts)
+
         for i, c in enumerate(clips):
             seg_dur = max(c["end"] - c["start"], 0.4)
-            rate = min(max(c["duration"] / seg_dur, 0.85), 2.0)
+            raw_rate = c["duration"] / seg_dur if seg_dur > 0 else 1.0
+            clamped_rate = min(max(raw_rate, 0.5), 4.0)
             delay_ms = max(0, int(round(c["start"] * 1000)))
             chain = "aformat=channel_layouts=stereo"
-            if abs(rate - 1) > 0.02:
-                chain += ",atempo=%.3f" % rate
+            chain += _build_atempo_chain(clamped_rate)
+            chain += ",aresample=48000:async=1:min_hard_comp=0.100000,apad,atrim=start=0:duration=%.3f" % seg_dur
             chain += ",adelay=%d|%d:all=1" % (delay_ms, delay_ms)
             filters.append("[%d:a]%s[v%d]" % (i + 1, chain, i))
 

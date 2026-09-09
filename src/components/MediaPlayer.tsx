@@ -563,10 +563,11 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
     audio.onloadedmetadata = () => {
       const audioDuration = audio.duration;
       if (audioDuration > 0 && remainingSegment > 0) {
-        // Rate needed so audio finishes exactly when the video segment ends
+        // Rate needed so audio finishes exactly when the video segment ends — 100% sync.
         const requiredRate = audioDuration / remainingSegment;
-        // Clamp: never slower than 0.85x, never faster than 1.8x (keeps it natural)
-        const rate = Math.min(Math.max(requiredRate, 0.85), 1.8);
+        // Allow 0.5x (slow pad) to 4x (fast) — chained atempo on server side; preview mirrors it.
+        // Keeps speech natural while guaranteeing voice ↔ video lock.
+        const rate = Math.min(Math.max(requiredRate, 0.5), 4.0);
         audio.playbackRate = rate;
 
         // If we are significantly late AND audio is long, skip ahead proportionally
@@ -1032,12 +1033,12 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
 
       // Schedule every dubbed segment at its exact video timestamp.
       // playbackRate = audioDuration / segmentDuration  → time-stretch so the
-      // phrase ENDS precisely when its subtitle segment ends (clamped 0.85–2.0x).
+      // phrase ENDS precisely when its subtitle segment ends (0.5–4.0x, 100% sync).
       for (const seg of segments) {
         const buf = buffers.get(seg.id);
         if (!buf) continue;
         const segDur = Math.max(seg.end - seg.start, 0.4);
-        const rate = Math.min(Math.max(buf.duration / segDur, 0.85), 2.0);
+        const rate = Math.min(Math.max(buf.duration / segDur, 0.5), 4.0);
         const src = ctx.createBufferSource();
         src.buffer = buf;
         src.playbackRate.value = rate;

@@ -1124,12 +1124,32 @@ async function processVideoJob(jobId: string): Promise<void> {
       );
     }
 
+    // Build atempo chain that covers any stretch ratio via FFmpeg's 0.5-2.0 per-filter range.
+    // This makes the dubbed voice EXACTLY fill its Whisper segment (100% sync) instead of
+    // clamping to 0.85-2.0 and leaving gaps/overlaps.
+    const buildAtempo = (rate: number): string => {
+      if (Math.abs(rate - 1) < 0.015) return '';
+      const parts: string[] = [];
+      let r = rate;
+      let guard = 0;
+      while (r > 2.0 && guard < 6) { parts.push('atempo=2.0'); r /= 2; guard++; }
+      while (r < 0.5 && guard < 6) { parts.push('atempo=0.5'); r /= 0.5; guard++; }
+      parts.push(`atempo=${r.toFixed(4)}`);
+      return ',' + parts.join(',');
+    };
     clips.forEach((c, i) => {
       const segDur = Math.max(c.end - c.start, 0.4);
-      const rate = Math.min(Math.max(c.duration / segDur, 0.85), 2.0);
+      // Exact rate so stretched TTS duration == segment duration (100% lip-sync).
+      // Web-quality clamp was 0.85-2.0 but that left gaps/overlaps -> now decompose via chain.
+      const rawRate = c.duration / segDur;
+      // Keep speech natural: allow 0.5x (slow) to 4x (fast) via chained atempo.
+      const clampedRate = Math.min(Math.max(rawRate, 0.5), 4.0);
       const delayMs = Math.max(0, Math.round(c.start * 1000));
       let chain = 'aformat=channel_layouts=stereo';
-      if (Math.abs(rate - 1) > 0.02) chain += `,atempo=${rate.toFixed(3)}`;
+      chain += buildAtempo(clampedRate);
+      // Force output to EXACTLY segDur: stretched clip that is too short gets padded
+      // with silence, too long gets trimmed — so amix never drifts from the video timeline.
+      chain += `,aresample=48000:async=1:min_hard_comp=0.100000,apad,atrim=start=0:duration=${segDur.toFixed(3)}`;
       chain += `,adelay=${delayMs}|${delayMs}:all=1`;
       filters.push(`[${i + 1}:a]${chain}[v${i}]`);
     });
