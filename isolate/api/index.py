@@ -1545,11 +1545,19 @@ def _shotstack_ingest_upload(path, filename):
         mime = "video/webm"
     elif low.endswith(".mov"):
         mime = "video/quicktime"
-    try:
-        r = requests.put(signed, data=data, headers={"Content-Type": mime}, timeout=300)
-        r.raise_for_status()
-    except Exception as e:
-        raise RuntimeError("Shotstack upload failed: %s" % e)
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.put(signed, data=data, headers={"Content-Type": mime}, timeout=300)
+            r.raise_for_status()
+            last_err = None
+            break
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            print("[Shotstack] upload attempt %d/3 failed: %s" % (attempt + 1, e))
+            time.sleep(3 * (attempt + 1))
+    if last_err is not None:
+        raise RuntimeError("Shotstack upload failed: %s" % last_err)
     deadline = time.time() + 180
     while time.time() < deadline:
         try:

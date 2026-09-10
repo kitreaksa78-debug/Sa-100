@@ -1417,8 +1417,17 @@ async function shotstackIngestUpload(filePath: string, filename: string): Promis
   else if (low.endsWith('.m4a') || low.endsWith('.aac')) mime = 'audio/mp4';
   else if (low.endsWith('.webm')) mime = 'video/webm';
   else if (low.endsWith('.mov')) mime = 'video/quicktime';
-  const putRes = await fetch(signed, { method: 'PUT', headers: { 'Content-Type': mime }, body: buf });
-  if (!putRes.ok) throw new Error(`Shotstack upload failed (${putRes.status})`);
+  let putRes: Response | null = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      putRes = await fetch(signed, { method: 'PUT', headers: { 'Content-Type': mime }, body: buf });
+      if (putRes.ok) break;
+    } catch (err: any) {
+      console.warn(`[Shotstack] upload attempt ${attempt}/3 failed:`, err?.message || err);
+    }
+    if (attempt < 3) await new Promise((res) => setTimeout(res, 3000 * attempt));
+  }
+  if (!putRes || !putRes.ok) throw new Error(`Shotstack upload failed (${putRes?.status || 'network error'})`);
 
   const deadline = Date.now() + 180_000;
   while (Date.now() < deadline) {
