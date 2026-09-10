@@ -46,6 +46,25 @@
   .rounded-2xl {
     transition: box-shadow 0.2s ease;
   }
+  /* Slim, brand-neutral scrollbars (transcript lists, stepper) */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #d6d3d1;
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #a8a29e;
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #d6d3d1 transparent;
+  }
 }
 
 /* Animate-in utility */

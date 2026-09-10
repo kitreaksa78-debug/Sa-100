@@ -49,7 +49,9 @@ export const WelcomePage: React.FC<WelcomePageProps> = ({
   const steps = [
     { n: '01', title: t.wStep1Title, desc: t.wStep1Desc },
     { n: '02', title: t.wStep2Title, desc: t.wStep2Desc },
-    { n: '03', title: t.wStep3Title, desc: t.wStep3Desc },
+    { n: '03', title: t.wStep3EditTitle, desc: t.wStep3EditDesc },
+    { n: '04', title: t.wStep4Title, desc: t.wStep4Desc },
+    { n: '05', title: t.wStep5Title, desc: t.wStep5Desc },
   ];
 
   const openSignIn = () => {
@@ -234,17 +236,17 @@ export const WelcomePage: React.FC<WelcomePageProps> = ({
               {t.wHowTitle}
             </h3>
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 sm:gap-6">
-            {steps.map((s, i) => (
-              <div key={s.n} className="relative rounded-2xl border border-stone-200/80 bg-white/90 backdrop-blur p-6 shadow-xs">
-                <div className="text-3xl font-extrabold bg-gradient-to-r from-orange-500/30 to-amber-500/30 bg-clip-text text-transparent">
+          <div className="grid grid-cols-1 sm:grid-cols-5 gap-3 sm:gap-4">
+            {steps.map((s) => (
+              <div
+                key={s.n}
+                className="relative rounded-2xl border border-stone-200/80 bg-white/90 backdrop-blur p-4 sm:p-5 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all"
+              >
+                <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-orange-100 to-amber-100 text-orange-600 flex items-center justify-center text-sm font-extrabold mb-3">
                   {s.n}
                 </div>
-                <h4 className="mt-2 text-sm font-bold text-stone-900">{s.title}</h4>
-                <p className="mt-1.5 text-xs text-stone-500 leading-relaxed">{s.desc}</p>
-                {i < steps.length - 1 && (
-                  <ChevronRight className="hidden sm:block absolute top-1/2 -right-4 w-4 h-4 text-stone-300 -translate-y-1/2" />
-                )}
+                <h4 className="text-xs sm:text-sm font-bold text-stone-900 leading-snug">{s.title}</h4>
+                <p className="mt-1.5 text-[11px] text-stone-500 leading-relaxed">{s.desc}</p>
               </div>
             ))}
           </div>

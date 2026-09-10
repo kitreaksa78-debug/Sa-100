@@ -33,6 +33,10 @@ export interface Mp4JobOptions {
   mediaType: 'video' | 'audio' | null;
   targetLanguage: string;
   removeVocals: boolean;
+  /** Mix console levels — applied by the server FFmpeg pipeline. */
+  voiceGain?: number;
+  bgGain?: number;
+  duckDepth?: 'light' | 'normal' | 'deep';
   setExportStep?: (step: string | null) => void;
   setExportProgress?: (fraction: number) => void;
   groqKey?: string;
@@ -141,6 +145,133 @@ async function uploadChunked(
   return { jobId, hasVideo: finJson.hasVideo };
 }
 
+/**
+ * Shotstack cloud render (sandbox): the original video + the AI voice clips
+ * are hosted via the Shotstack Ingest API, composed on a timeline and rendered
+ * by Shotstack's Edit API into a hosted MP4. Sandbox renders are unlimited for
+ * development but carry a watermark and are capped at 10 minutes.
+ *
+ * Flow:
+ *   POST /api/video/upload            → { jobId } (reused from the FFmpeg path)
+ *   POST /api/video/shotstack-render  → starts the cloud job
+ *   GET  /api/video/shotstack-status  → { status, progress, message, url }
+ */
+export async function exportEditedMp4Shotstack(
+  result: TranscriptionResult,
+  opts: Mp4JobOptions
+): Promise<ServerMp4Result | null> {
+  const { setExportStep, setExportProgress } = opts;
+  const step = (phase: Mp4JobPhase) => setExportStep?.(phase);
+  const progress = (p: number) => setExportProgress?.(Math.max(0, Math.min(1, p)));
+
+  step('uploading');
+  progress(0.02);
+
+  // 1. Probe whether the Shotstack pipeline is configured on the server.
+  let caps: { shotstack?: boolean; chunked?: boolean } | null = null;
+  try {
+    const res = await fetch(apiUrl('video/capabilities'));
+    if (res.ok) caps = await res.json();
+  } catch {
+    /* endpoint missing → serverless deploy quirk */
+  }
+  if (!caps?.shotstack) return null;
+
+  // 2. Upload the ORIGINAL media (full quality, never the shrunk audio).
+  const media = await resolveOriginalMedia(opts);
+  if (!media) throw new Error('No original media available for MP4 generation');
+
+  const SERVERLESS_CHUNK_THRESHOLD = 3 * 1024 * 1024;
+  const shouldChunkFirst = Boolean(caps?.chunked) && media.size > SERVERLESS_CHUNK_THRESHOLD;
+
+  let jobId = '';
+  if (shouldChunkFirst) {
+    const r = await uploadChunked(media, (f) => progress(0.02 + f * 0.2));
+    jobId = r.jobId;
+  } else {
+    try {
+      const r = await uploadMultipart(media);
+      jobId = r.jobId;
+    } catch (e: any) {
+      const is413 = e?.status === 413 || String(e?.message || '').includes('413');
+      if (is413 && caps?.chunked) {
+        const r2 = await uploadChunked(media, (f) => progress(0.02 + f * 0.2));
+        jobId = r2.jobId;
+      } else {
+        throw e;
+      }
+    }
+  }
+  if (!jobId) throw new Error('Upload did not return a jobId');
+
+  // 3. Submit the Shotstack render.
+  step('tts');
+  progress(0.28);
+  const segments = result.segments.map((s) => ({
+    id: s.id,
+    start: s.start,
+    end: s.end,
+    translatedText: s.translatedText,
+    dubbedAudioBase64: s.dubbedAudioBase64,
+  }));
+  const submitRes = await fetch(apiUrl('video/shotstack-render'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jobId,
+      segments,
+      removeVocals: opts.removeVocals,
+      targetLanguage: opts.targetLanguage,
+      voiceGain: typeof opts.voiceGain === 'number' ? opts.voiceGain : 1,
+      bgGain: typeof opts.bgGain === 'number' ? opts.bgGain : 1,
+      duckDepth: opts.duckDepth || 'normal',
+    }),
+  });
+  if (!submitRes.ok) {
+    const err = await submitRes.json().catch(() => ({}));
+    throw new Error(err.error || `Shotstack render failed (${submitRes.status})`);
+  }
+
+  // 4. Poll the Shotstack job until done/error.
+  const statusUrl =
+    apiUrl('video/shotstack-status') +
+    (apiUrl('video/shotstack-status').includes('?') ? '&' : '?') +
+    `jobId=${encodeURIComponent(jobId)}`;
+  const started = Date.now();
+  const TIMEOUT_MS = 20 * 60 * 1000; // Shotstack sandbox caps renders at 10 minutes
+  while (Date.now() - started < TIMEOUT_MS) {
+    await new Promise((r) => setTimeout(r, 3000));
+    let status: any = null;
+    try {
+      const res = await fetch(statusUrl);
+      if (res.ok) status = await res.json();
+    } catch {
+      /* transient network hiccup — keep polling */
+    }
+    if (!status) continue;
+    if (status.status === 'done') {
+      step('preparing');
+      progress(0.97);
+      const filename = status.downloadFilename || `translated-${opts.targetLanguage}.mp4`;
+      return {
+        url: String(status.url || ''),
+        ext: 'mp4',
+        size: Number(status.size) || 0,
+        filename,
+      };
+    }
+    if (status.status === 'error') {
+      throw new Error(status.error || 'Shotstack render failed on the server');
+    }
+    const msg = String(status.message || '').toLowerCase();
+    if (msg.includes('upload')) step('uploading');
+    else if (msg.includes('render')) step('rendering');
+    else step('mixing');
+    progress(0.3 + Math.min(0.66, (Number(status.progress) || 0) / 100) * 0.66);
+  }
+  throw new Error('Shotstack render timed out');
+}
+
 async function uploadMultipart(media: File): Promise<{ jobId: string; hasVideo?: boolean }> {
   const form = new FormData();
   form.append('video', media, media.name || 'original.mp4');
@@ -241,6 +372,9 @@ export async function exportEditedMp4ServerSide(
       segments,
       removeVocals: opts.removeVocals,
       targetLanguage: opts.targetLanguage,
+      voiceGain: typeof opts.voiceGain === 'number' ? opts.voiceGain : 1,
+      bgGain: typeof opts.bgGain === 'number' ? opts.bgGain : 1,
+      duckDepth: opts.duckDepth || 'normal',
     }),
   });
   if (!procRes.ok) {

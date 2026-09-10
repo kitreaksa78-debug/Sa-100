@@ -1010,7 +1010,10 @@ def _set_job(job_id, **kw):
 def _probe_original(ffmpeg, path):
     """Parse `ffmpeg -i` stderr for duration / streams (no ffprobe on hosting)."""
     try:
-        proc = subprocess.run([ffmpeg, "-i", path], capture_output=True, text=True, timeout=60)
+        # Generous timeout: a single ffmpeg start can take ~60s on the cold
+        # serverless runtime, and timing out here silently drops the video
+        # stream detection (which would export audio-only files).
+        proc = subprocess.run([ffmpeg, "-i", path], capture_output=True, text=True, timeout=300)
         err = proc.stderr or ""
     except Exception:
         err = ""
@@ -1037,19 +1040,32 @@ def _probe_original(ffmpeg, path):
     return {"duration": duration, "has_video": has_video, "has_audio": has_audio, "vcodec": vcodec, "vpix": vpix, "channels": channels}
 
 
-def _clip_duration(ffmpeg, path):
-    """Convert a clip to WAV then read its duration from the header."""
-    wav_path = path + ".wav"
+def _clips_duration_batch(ffmpeg, paths):
+    """Convert several clips to WAV in ONE ffmpeg run and read durations.
+
+    On the serverless runtime a single `ffmpeg` invocation costs tens of
+    seconds of cold/CPU time, so probing clips one-by-one would make any video
+    with many segments time out. Batching keeps the whole job to one run.
+    """
+    if not paths:
+        return {}
+    args = [ffmpeg, "-y"]
+    for p in paths:
+        args += ["-i", p]
+    for i, p in enumerate(paths):
+        args += ["-map", "%d:a" % i, "-ac", "2", "-ar", "48000", p + ".wav"]
     try:
-        subprocess.run(
-            [ffmpeg, "-y", "-i", path, "-ar", "48000", "-ac", "2", wav_path],
-            capture_output=True,
-            timeout=60,
-        )
-        with wave.open(wav_path, "rb") as w:
-            return w.getnframes() / float(w.getframerate())
+        subprocess.run(args, capture_output=True, timeout=600)
     except Exception:
-        return 0.0
+        pass
+    durations = {}
+    for p in paths:
+        try:
+            with wave.open(p + ".wav", "rb") as w:
+                durations[p] = w.getnframes() / float(w.getframerate())
+        except Exception:
+            durations[p] = 0.0
+    return durations
 
 
 def _process_video_job(job_id):
@@ -1073,37 +1089,71 @@ def _process_video_job(job_id):
         segs = job.get("segments") or []
         clips = []
         with_audio = [s for s in segs if (s.get("dubbedAudioBase64") or "") and len(s["dubbedAudioBase64"]) > 100]
+        # Auto-voice: synthesize AI speech on the server for segments that
+        # have none yet (Edge TTS, then Google TTS), so the render step always
+        # produces a fully dubbed video even when the user skipped the
+        # voice-generation step in the UI.
+        missing = [s for s in segs if (s.get("translatedText") or "").strip() and len((s.get("dubbedAudioBase64") or "")) <= 100]
+        for i, seg in enumerate(missing):
+            try:
+                _set_job(job_id, progress=17 + int(3 * i / max(len(missing), 1)), message="Generating AI voice (%d/%d)" % (i + 1, len(missing)))
+                audio = edge_tts_speech(seg["translatedText"].strip(), job.get("targetLanguage") or "km")
+                if not audio or len(audio) <= 100:
+                    try:
+                        audio = google_tts(seg["translatedText"].strip(), job.get("targetLanguage") or "km")
+                    except Exception:  # noqa: BLE001
+                        audio = None
+                if audio and len(audio) > 100:
+                    seg["dubbedAudioBase64"] = base64.b64encode(audio).decode("ascii")
+                    with_audio.append(seg)
+            except Exception as err:  # noqa: BLE001
+                print("[VideoJobs] auto-tts seg %s failed: %s" % (seg.get("id"), err))
+        # Write every dubbed clip to disk first, then convert them ALL to WAV in
+        # one ffmpeg invocation (per-clip ffmpeg calls cost tens of seconds each
+        # on the slow serverless runtime and would time out long videos).
+        written = []
         for i, seg in enumerate(with_audio):
             try:
                 data = base64.b64decode(seg["dubbedAudioBase64"])
                 if len(data) < 100:
                     continue
                 kind = _sniff_audio_kind(data)
-                clip_path = os.path.join(job_dir, "clip_%04d.%s" % (len(clips), kind))
+                clip_path = os.path.join(job_dir, "clip_%04d.%s" % (len(written), kind))
                 with open(clip_path, "wb") as f:
                     f.write(data)
-                dur = _clip_duration(ffmpeg, clip_path)
-                start = max(0.0, float(seg.get("start") or 0))
-                end = max(float(seg.get("end") or start + 0.5), start + 0.3)
-                if dur > 0.05:
-                    clips.append({"start": start, "end": end, "path": clip_path, "duration": dur})
+                written.append(
+                    {
+                        "path": clip_path,
+                        "start": max(0.0, float(seg.get("start") or 0)),
+                        "end": max(float(seg.get("end") or 0), 0.0),
+                    }
+                )
             except Exception as err:
-                print("[VideoJobs] clip %s failed: %s" % (i, err))
+                print("[VideoJobs] clip write %s failed: %s" % (i, err))
             _set_job(job_id, progress=20 + int(25 * (i + 1) / max(len(with_audio), 1)), message="Generating translated audio (%d/%d)" % (i + 1, len(with_audio)))
+        durs = _clips_duration_batch(ffmpeg, [w["path"] for w in written])
+        for w in written:
+            dur = durs.get(w["path"], 0.0)
+            start = w["start"]
+            end = max(w["end"], start + 0.3)
+            if dur > 0.05:
+                clips.append({"start": start, "end": end, "path": w["path"], "duration": dur})
 
         _set_job(job_id, progress=50, message="Mixing audio")
         filters = []
         apply_center_cancel = bool(job.get("removeVocals")) and stereo
         if has_audio:
+            # Background bus. True-stereo sources get the original speaker removed
+            # by cancelling the center channel (speech is almost always
+            # center-panned), leaving music / ambience / SFX intact; mono and
+            # dual-mono sources keep the full track because the math cannot
+            # separate them.
+            bg_gain = job.get("bgGain", 1)
+            bg_vol = ",volume=%.3f" % bg_gain if bg_gain != 1 else ""
             if apply_center_cancel:
-                filters.append("[0:a]aformat=channel_layouts=stereo,pan=stereo|c0=c0-c1|c1=c1-c0[bg0]")
+                filters.append("[0:a]aformat=channel_layouts=stereo,aresample=48000,pan=stereo|c0=c0-c1|c1=c1-c0%s[bg0]" % bg_vol)
             else:
-                filters.append("[0:a]aformat=channel_layouts=stereo[bg0]")
-            cond = "+".join("between(t,%.2f,%.2f)" % (c["start"], c["end"]) for c in clips)
-            if cond:
-                filters.append("[bg0]volume='if(%s>=1,0.45,1)':eval=frame[bg]" % cond)
-            else:
-                filters.append("[bg0]anull[bg]")
+                filters.append("[0:a]aformat=channel_layouts=stereo,aresample=48000%s[bg0]" % bg_vol)
 
         def _build_atempo_chain(rate):
             if abs(rate - 1) < 0.015:
@@ -1122,32 +1172,87 @@ def _process_video_job(job_id):
             parts.append("atempo=%.4f" % r)
             return "," + ",".join(parts)
 
+        def _build_clip_chain(seg_dur, raw_rate, start):
+            clamped_rate = min(max(raw_rate, 0.5), 4.0)
+            delay_ms = max(0, int(round(start * 1000)))
+            v_gain = job.get("voiceGain", 1)
+            v_vol = ("volume=%.3f," % v_gain) if v_gain != 1 else ""
+            chain = "%saformat=channel_layouts=stereo" % v_vol
+            chain += _build_atempo_chain(clamped_rate)
+            chain += ",aresample=48000:async=1:min_hard_comp=0.100000,apad,atrim=start=0:duration=%.3f" % seg_dur
+            # Click-free edges: tiny fade in/out so the voice blends into the
+            # scene instead of starting/stopping abruptly.
+            if seg_dur > 0.25:
+                fade_out_start = max(0.0, seg_dur - 0.1)
+                chain += ",afade=t=in:st=0:d=0.03,afade=t=out:st=%.3f:d=0.1" % fade_out_start
+            # Per-channel delays for the stereo bus (0|0 = both channels at the
+            # segment start). No `all=1` — it needs FFmpeg >= 5 and is redundant
+            # here since aformat already forced stereo.
+            chain += ",adelay=%d|%d" % (delay_ms, delay_ms)
+            return chain
+
         for i, c in enumerate(clips):
             seg_dur = max(c["end"] - c["start"], 0.4)
             raw_rate = c["duration"] / seg_dur if seg_dur > 0 else 1.0
-            clamped_rate = min(max(raw_rate, 0.5), 4.0)
-            delay_ms = max(0, int(round(c["start"] * 1000)))
-            chain = "aformat=channel_layouts=stereo"
-            chain += _build_atempo_chain(clamped_rate)
-            chain += ",aresample=48000:async=1:min_hard_comp=0.100000,apad,atrim=start=0:duration=%.3f" % seg_dur
-            chain += ",adelay=%d|%d:all=1" % (delay_ms, delay_ms)
+            chain = _build_clip_chain(seg_dur, raw_rate, c["start"])
             filters.append("[%d:a]%s[v%d]" % (i + 1, chain, i))
 
+        # Voice bus (final mix).
+        def _make_bus(tag):
+            inputs = ["[%s%d]" % (tag, i) for i in range(len(clips))]
+            if len(inputs) == 1:
+                filters.append("%sanull[%sc]" % (inputs[0], tag))
+                return "[%sc]" % tag
+            filters.append("".join(inputs) + "amix=inputs=%d:duration=longest:dropout_transition=0:normalize=0,aresample=48000[%sc]" % (len(inputs), tag))
+            return "[%sc]" % tag
+
+        if clips:
+            vc = _make_bus("v")
+
+        # Precise automatic audio ducking — the "Music 100% -> 0% -> 100%"
+        # behavior. While the AI Khmer voice plays, the background
+        # music/ambience/SFX bus drops to `duck_level` (normal/deep = 0, i.e.
+        # FULL silence, so the original speaker can never bleed through as a
+        # double voice); in every gap it recovers to full volume instantly.
+        # The ducking is driven by an exact volume envelope per segment with
+        # short attack/release ramps, so transitions are smooth and click-free
+        # instead of the soft ducking a sidechain compressor would produce.
+        #   * light  -> background still audible at 25% under the voice
+        #   * normal -> background fully muted under the voice (default)
+        #   * deep   -> fully muted, with a longer hold around each line
         aout = None
         if has_audio:
-            inputs = ["[bg]"] + ["[v%d]" % i for i in range(len(clips))]
-            if len(inputs) == 1:
+            if clips:
+                duck_level = {"light": 0.75, "normal": 1.0, "deep": 1.0}.get(
+                    job.get("duckDepth", "normal"), 1.0
+                )
+                pre = 0.08   # start ducking 80 ms before the voice starts
+                post = 0.15  # recover 150 ms after the voice ends
+                fade = 0.08  # ramp length (seconds)
+                terms = []
+                for c in clips:
+                    s = max(0.0, c["start"] - pre)
+                    e = max(c["end"] + post, s + 0.4)
+                    terms.append(
+                        "min(1,max(0,min((t-%.3f)/%.3f,(%.3f-t)/%.3f)))"
+                        % (s, fade, e, fade)
+                    )
+                if terms:
+                    duck_expr = "1-%s*min(1,%s)" % (duck_level, "+".join(terms))
+                    filters.append("[bg0]volume='%s':eval=frame[bg]" % duck_expr)
+                    # Final mix: ducked background + voice bus, with a limiter
+                    # so the sum can never clip -> no distortion, no harsh peaks.
+                    filters.append("[bg][vc]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,aresample=48000,alimiter=limit=0.95:level=false[aout]")
+                    aout = "[aout]"
+                else:
+                    filters.append("[bg0]anull[bg]")
+                    aout = "[bg]"
+            else:
+                filters.append("[bg0]anull[bg]")
                 aout = "[bg]"
-            else:
-                filters.append("".join(inputs) + "amix=inputs=%d:duration=first:dropout_transition=0:normalize=0,aresample=48000[aout]" % len(inputs))
-                aout = "[aout]"
         elif clips:
-            inputs = ["[v%d]" % i for i in range(len(clips))]
-            if len(inputs) == 1:
-                aout = inputs[0]
-            else:
-                filters.append("".join(inputs) + "amix=inputs=%d:duration=longest:dropout_transition=0:normalize=0,aresample=48000[aout]" % len(inputs))
-                aout = "[aout]"
+            filters.append("[vc]alimiter=limit=0.95:level=false[aout]")
+            aout = "[aout]"
 
         output_ext = "mp3" if not has_video else "mp4"
         output_path = os.path.join(job_dir, "output.%s" % output_ext)
@@ -1201,9 +1306,11 @@ def _process_video_job(job_id):
             print("[VideoJobs] FFmpeg args: %s" % " ".join(args_re[:6]))
             result = subprocess.run([ffmpeg_bin] + args_re, capture_output=True, timeout=1200)
             if result.returncode != 0:
-                err_msg = (result.stderr or b"").decode(errors="ignore")[-500:]
+                # Keep the END of stderr — that is where the actual error lines
+                # are printed (input dumps come earlier).
+                err_msg = (result.stderr or b"").decode(errors="ignore")[-1200:]
                 print("[VideoJobs] FFmpeg re-encode failed (code %d): %s" % (result.returncode, err_msg))
-                raise RuntimeError("FFmpeg render failed (code %d): %s" % (result.returncode, err_msg[:200]))
+                raise RuntimeError("FFmpeg render failed (code %d): %s" % (result.returncode, err_msg))
             print("[VideoJobs] FFmpeg re-encode succeeded")
 
         if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
@@ -1229,11 +1336,18 @@ def _process_video_job(job_id):
 
 
 def handle_video_capabilities():
-    return jsonify({"ffmpeg": bool(_ffmpeg_exe()), "chunked": True, "maxUploadBytes": 200 * 1024 * 1024})
+    return jsonify(
+        {
+            "ffmpeg": bool(_ffmpeg_exe()),
+            "shotstack": bool(SHOTSTACK_API_KEY),
+            "chunked": True,
+            "maxUploadBytes": 200 * 1024 * 1024,
+        }
+    )
 
 
 def handle_video_upload():
-    if not _ffmpeg_exe():
+    if not _ffmpeg_exe() and not SHOTSTACK_API_KEY:
         return jsonify({"error": "FFmpeg is not installed on the server — MP4 generation is unavailable."}), 501
 
     body = request.get_json(silent=True) or {}
@@ -1329,6 +1443,16 @@ def handle_video_process():
     job["segments"] = segments
     job["removeVocals"] = bool(body.get("removeVocals", True))
     job["targetLanguage"] = body.get("targetLanguage") or "km"
+    # Mix console levels (0..2 voice gain, 0..1 background gain, duck profile)
+    try:
+        job["voiceGain"] = min(max(float(body.get("voiceGain", 1)), 0.0), 2.0)
+    except Exception:
+        job["voiceGain"] = 1.0
+    try:
+        job["bgGain"] = min(max(float(body.get("bgGain", 1)), 0.0), 1.0)
+    except Exception:
+        job["bgGain"] = 1.0
+    job["duckDepth"] = body.get("duckDepth") if body.get("duckDepth") in ("light", "normal", "deep") else "normal"
     _set_job(job_id, status="processing", progress=10, message="Preparing", error=None)
     threading.Thread(target=_process_video_job, args=(job_id,), daemon=True).start()
     return jsonify({"jobId": job_id, "status": "processing"})
@@ -1366,10 +1490,407 @@ def handle_video_download():
     return send_file(path, mimetype=mimetype, as_attachment=True, download_name=filename)
 
 
+
+# ---------------------------------------------------------------- Shotstack
+# Cloud video rendering (sandbox): the original video + the translated AI
+# voice clips are hosted via the Shotstack Ingest API, composed on a timeline
+# (video track with muted/ducked original audio + a voice track), and rendered
+# by Shotstack's Edit API into a hosted MP4. Sandbox renders carry a watermark
+# and are capped at 10 minutes — unlimited development renders.
+SHOTSTACK_API_KEY = os.getenv("SHOTSTACK_API_KEY", "").strip()
+SHOTSTACK_INGEST_BASE = "https://api.shotstack.io/ingest/stage"
+SHOTSTACK_EDIT_BASE = "https://api.shotstack.io/edit/stage"
+_SHOTSTACK_RENDERS = {}
+_SHOTSTACK_RENDERS_LOCK = threading.Lock()
+
+
+def _shotstack_headers(extra=None):
+    h = {"Accept": "application/json", "x-api-key": SHOTSTACK_API_KEY}
+    if extra:
+        h.update(extra)
+    return h
+
+
+def _shotstack_ingest_upload(path, filename):
+    """Upload a local file to Shotstack storage; returns the hosted source URL."""
+    if not SHOTSTACK_API_KEY:
+        raise RuntimeError("SHOTSTACK_API_KEY is not configured on the server")
+    try:
+        r = requests.post(
+            SHOTSTACK_INGEST_BASE + "/upload",
+            headers=_shotstack_headers({"Content-Type": "application/json"}),
+            json={"filename": filename},
+            timeout=30,
+        )
+        r.raise_for_status()
+        up = r.json()["data"]
+        up_id = up["id"]
+        signed = up["attributes"]["url"]
+    except Exception as e:
+        raise RuntimeError("Shotstack upload init failed: %s" % e)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except Exception as e:
+        raise RuntimeError("Cannot read upload file: %s" % e)
+    low = filename.lower()
+    mime = "video/mp4"
+    if low.endswith(".wav"):
+        mime = "audio/wav"
+    elif low.endswith(".mp3"):
+        mime = "audio/mpeg"
+    elif low.endswith(".m4a") or low.endswith(".aac"):
+        mime = "audio/mp4"
+    elif low.endswith(".webm"):
+        mime = "video/webm"
+    elif low.endswith(".mov"):
+        mime = "video/quicktime"
+    try:
+        r = requests.put(signed, data=data, headers={"Content-Type": mime}, timeout=300)
+        r.raise_for_status()
+    except Exception as e:
+        raise RuntimeError("Shotstack upload failed: %s" % e)
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        try:
+            r = requests.get(SHOTSTACK_INGEST_BASE + "/sources/" + up_id, headers=_shotstack_headers(), timeout=30)
+            r.raise_for_status()
+            src = r.json()["data"]["attributes"]
+            st = src.get("status")
+            if st == "ready":
+                return src.get("source")
+            if st == "failed":
+                raise RuntimeError("Shotstack ingest failed for %s" % filename)
+        except RuntimeError:
+            raise
+        except Exception:
+            pass  # transient — keep polling
+        time.sleep(3)
+    raise RuntimeError("Shotstack ingest timed out for %s" % filename)
+
+
+def _shotstack_start_render(job_id):
+    try:
+        job = _VIDEO_JOBS.get(job_id)
+        if not job or not job.get("inputPath"):
+            _set_job(job_id, status="error", error="Job not found", progress=100)
+            return
+        job_dir = job.get("dir")
+        original_path = job["inputPath"]
+        orig_name = os.path.basename(original_path) or "original.mp4"
+        _set_job(job_id, status="processing", progress=15, message="Uploading to Shotstack", error=None)
+
+        original_url = _shotstack_ingest_upload(original_path, orig_name)
+
+        segs = job.get("segments") or []
+        with_audio = [s for s in segs if (s.get("dubbedAudioBase64") or "") and len(s["dubbedAudioBase64"]) > 100]
+        clips = []
+        # Auto-voice: synthesize AI speech on the server for segments that
+        # have none yet, so Render always produces a fully dubbed video even
+        # when the user skipped the voice-generation step in the UI.
+        missing = [s for s in segs if (s.get("translatedText") or "").strip() and len((s.get("dubbedAudioBase64") or "")) <= 100]
+        for i, seg in enumerate(missing):
+            try:
+                _set_job(job_id, progress=12 + int(8 * i / max(len(missing), 1)), message="Generating AI voice (%d/%d)" % (i + 1, len(missing)))
+                audio = edge_tts_speech(seg["translatedText"].strip(), job.get("targetLanguage") or "km")
+                if not audio or len(audio) <= 100:
+                    try:
+                        audio = google_tts(seg["translatedText"].strip(), job.get("targetLanguage") or "km")
+                    except Exception:  # noqa: BLE001
+                        audio = None
+                if audio and len(audio) > 100:
+                    seg["dubbedAudioBase64"] = base64.b64encode(audio).decode("ascii")
+                    with_audio.append(seg)
+            except Exception as err:  # noqa: BLE001
+                print("[Shotstack] auto-tts seg %s failed: %s" % (seg.get("id"), err))
+        for i, seg in enumerate(with_audio):
+            try:
+                data = base64.b64decode(seg["dubbedAudioBase64"])
+                if len(data) < 100:
+                    continue
+                kind = _sniff_audio_kind(data)
+                clip_path = os.path.join(job_dir, "shotstack_clip_%04d.%s" % (i, kind))
+                with open(clip_path, "wb") as f:
+                    f.write(data)
+                url = _shotstack_ingest_upload(clip_path, os.path.basename(clip_path))
+                clips.append({"start": max(0.0, float(seg.get("start") or 0)), "end": max(float(seg.get("end") or 0), 0.0), "url": url})
+            except Exception as err:
+                print("[Shotstack] clip upload %d failed: %s" % (i, err))
+            _set_job(job_id, progress=15 + int(20 * (i + 1) / max(len(with_audio), 1)), message="Uploading voice clips (%d/%d)" % (i + 1, len(with_audio)))
+
+        duration = max([c["end"] for c in clips] + [0.0])
+        if duration <= 0:
+            duration = max([float(s.get("end") or 0) for s in segs] or [0.0])
+        duration = max(duration + 1.0, 3.0)
+        remove_vocals = bool(job.get("removeVocals", True))
+        bg_gain = float(job.get("bgGain", 1) or 1)
+        voice_gain = float(job.get("voiceGain", 1) or 1)
+        duck_depth = job.get("duckDepth") if job.get("duckDepth") in ("light", "normal", "deep") else "normal"
+
+        # Interval ducking for Shotstack (no sidechain compressor there, so
+        # ducking is expressed as timeline audio segments): the original voice
+        # dips while the AI voice speaks (no double voice) and the background
+        # music/ambience/SFX return to full level in every gap between the AI
+        # speech intervals.
+        DUCK_GAIN = {"light": 0.35, "normal": 0.0, "deep": 0.0}
+        DUCK_PAD = {"light": 0.15, "normal": 0.30, "deep": 0.45}
+        duck_gain = DUCK_GAIN[duck_depth]
+
+        # Background audio source:
+        #  * "keep original soundtrack" (removeVocals=false): the original
+        #    source itself, layered via video assets (Shotstack audio assets
+        #    reject .mp4 sources).
+        #  * "remove original voice, keep the music" (removeVocals=true): a
+        #    server-side center-cancelled (music-only) WAV when the source is
+        #    true stereo, so the background music/ambience/SFX survive exactly
+        #    like the UI promises; mono/dual-mono sources cannot be separated,
+        #    so the original soundtrack stays fully muted there.
+        bg_url = None
+        if remove_vocals:
+            ffmpeg = _ffmpeg_exe()
+            if ffmpeg:
+                info = _probe_original(ffmpeg, original_path)
+                if info.get("has_audio") and info.get("channels", 1) >= 2:
+                    bg_path = os.path.join(job_dir, "shotstack_bg.wav")
+                    cmd = [
+                        ffmpeg, "-y", "-i", original_path,
+                        "-af", "aformat=channel_layouts=stereo,aresample=48000,pan=stereo|c0=c0-c1|c1=c1-c0,volume=%.3f" % bg_gain,
+                        "-c:a", "pcm_s16le",
+                        "-t", "%.3f" % duration,
+                        bg_path,
+                    ]
+                    try:
+                        subprocess.run(cmd, capture_output=True, timeout=600)
+                        if os.path.exists(bg_path) and os.path.getsize(bg_path) > 2000:
+                            bg_url = _shotstack_ingest_upload(bg_path, "bg_music.wav")
+                    except Exception as err:  # noqa: BLE001
+                        print("[Shotstack] background separation failed: %s" % err)
+
+        # The base video track is always silent — the soundtrack comes from
+        # per-window background layers below.
+        video_track = {
+            "clips": [
+                {
+                    "asset": {"type": "video", "src": original_url, "volume": 0.0},
+                    "start": 0,
+                    "length": duration,
+                }
+            ]
+        }
+        tracks = [video_track]
+        if clips:
+            pad = DUCK_PAD[duck_depth]
+            ranges = sorted([max(0.0, c["start"] - pad), max(c["end"] + pad, c["start"] + 0.4)] for c in clips)
+            merged = []
+            for s, e in ranges:
+                if merged and s <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], e)
+                else:
+                    merged.append([s, e])
+            # Background windows: full music in the gaps (gap_gain), silence
+            # (duck_gain, 0 by default) while the AI voice speaks. Shotstack
+            # audio assets reject .mp4 sources, so the original soundtrack is
+            # re-layered as video assets (they carry their audio with them); a
+            # separated music-only WAV is used when the original voice was
+            # removed.
+            gap_gain = bg_gain if (not remove_vocals or bg_url) else 0.0
+            windows = []
+            cursor = 0.0
+            for s, e in merged:
+                s = min(max(0.0, s), duration)
+                e = min(max(0.0, e), duration)
+                if e <= cursor:
+                    continue
+                if s - cursor > 0.05:
+                    windows.append((cursor, s, gap_gain))
+                if e - s > 0.05:
+                    windows.append((s, e, duck_gain))
+                cursor = max(cursor, e)
+            if duration - cursor > 0.05:
+                windows.append((cursor, duration, gap_gain))
+            # Merge consecutive windows with the SAME gain so the timeline
+            # stays compact (no visible pumping in the edit).
+            compact = []
+            for s, e, g in windows:
+                if compact and abs(compact[-1][2] - g) < 1e-9 and abs(compact[-1][1] - s) < 0.05:
+                    compact[-1][1] = e
+                else:
+                    compact.append([s, e, g])
+            if bg_url:
+                # Music-only WAV with per-window volume (audio assets accept
+                # wav sources; Shotstack caps clip volume at 1.0).
+                bg_track = {"clips": []}
+                for s, e, g in compact:
+                    bg_track["clips"].append({
+                        "asset": {"type": "audio", "src": bg_url, "volume": min(max(g, 0.0), 1.0)},
+                        "start": round(s, 3),
+                        "length": round(e - s, 3),
+                    })
+                tracks.append(bg_track)
+            elif not remove_vocals:
+                # Original soundtrack re-layered as video assets (video assets
+                # carry their audio with them): full background in the gaps,
+                # ducked to duck_gain while the AI voice speaks.
+                for s, e, g in compact:
+                    tracks.append({
+                        "clips": [{
+                            "asset": {"type": "video", "src": original_url, "volume": g},
+                            "start": round(s, 3),
+                            "length": round(e - s, 3),
+                        }]
+                    })
+            # else: remove_vocals with no separable background -> the original
+            # soundtrack stays fully muted; only the AI voice is audible.
+        if clips:
+            voice_track = {"clips": []}
+            for c in clips:
+                seg_dur = max(c["end"] - c["start"], 0.4)
+                voice_track["clips"].append(
+                    {
+                        # Shotstack caps clip volume at 1.0 — clamp voice gain.
+                        "asset": {"type": "audio", "src": c["url"], "volume": min(max(voice_gain, 0.0), 1.0)},
+                        "start": c["start"],
+                        "length": seg_dur,
+                    }
+                )
+            tracks.append(voice_track)
+
+        edit = {
+            "timeline": {"tracks": tracks},
+            "output": {"format": "mp4", "resolution": "sd", "fps": 30},
+        }
+        _set_job(job_id, progress=45, message="Submitting Shotstack render")
+        r = requests.post(
+            SHOTSTACK_EDIT_BASE + "/render",
+            headers=_shotstack_headers({"Content-Type": "application/json"}),
+            json=edit,
+            timeout=60,
+        )
+        if not r.ok:
+            print("[Shotstack] render rejected (%s): %s" % (r.status_code, r.text[:500]))
+            raise RuntimeError("Shotstack render rejected (%s): %s" % (r.status_code, r.text[:200]))
+        rid = r.json()["response"]["id"]
+        with _SHOTSTACK_RENDERS_LOCK:
+            _SHOTSTACK_RENDERS[job_id] = {"renderId": rid, "jobId": job_id}
+        _set_job(job_id, progress=50, message="Shotstack rendering (%s)" % rid)
+        print("[Shotstack] %s queued render %s" % (job_id, rid))
+    except Exception as err:
+        print("[Shotstack] %s failed: %s" % (job_id, err))
+        _set_job(job_id, status="error", error=str(err) or "Shotstack render failed", progress=100)
+
+
+def handle_shotstack_render():
+    body = request.get_json(silent=True) or {}
+    job_id = body.get("jobId")
+    segments = body.get("segments")
+    job = _VIDEO_JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "Unknown jobId — please upload the video again."}), 404
+    if not isinstance(segments, list) or not segments:
+        return jsonify({"error": "No subtitle segments provided"}), 400
+    if not SHOTSTACK_API_KEY:
+        return jsonify({"error": "SHOTSTACK_API_KEY is not configured on the server"}), 501
+    job["segments"] = segments
+    job["removeVocals"] = bool(body.get("removeVocals", True))
+    job["targetLanguage"] = body.get("targetLanguage") or "km"
+    try:
+        job["voiceGain"] = min(max(float(body.get("voiceGain", 1)), 0.0), 2.0)
+    except Exception:
+        job["voiceGain"] = 1.0
+    try:
+        job["bgGain"] = min(max(float(body.get("bgGain", 1)), 0.0), 1.0)
+    except Exception:
+        job["bgGain"] = 1.0
+    job["duckDepth"] = body.get("duckDepth") if body.get("duckDepth") in ("light", "normal", "deep") else "normal"
+    _set_job(job_id, status="processing", progress=10, message="Preparing Shotstack render", error=None)
+    threading.Thread(target=_shotstack_start_render, args=(job_id,), daemon=True).start()
+    return jsonify({"jobId": job_id, "status": "processing", "provider": "shotstack"})
+
+
+def handle_shotstack_status():
+    job_id = _extract_job_id() or request.args.get("jobId") or (request.get_json(silent=True) or {}).get("jobId")
+    job = _VIDEO_JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "Unknown jobId"}), 404
+    with _SHOTSTACK_RENDERS_LOCK:
+        entry = _SHOTSTACK_RENDERS.get(job_id)
+    if not entry or not entry.get("renderId"):
+        return jsonify(
+            {
+                "jobId": job_id,
+                "status": job.get("status"),
+                "progress": job.get("progress"),
+                "message": job.get("message"),
+                "error": job.get("error"),
+                "hasVideo": job.get("hasVideo"),
+                "provider": "shotstack",
+            }
+        )
+    rid = entry.get("renderId")
+    try:
+        r = requests.get(SHOTSTACK_EDIT_BASE + "/render/" + rid, headers=_shotstack_headers(), timeout=30)
+        r.raise_for_status()
+        resp = r.json().get("response", {})
+    except Exception as e:
+        print("[Shotstack] status poll failed: %s" % e)
+        return jsonify(
+            {
+                "jobId": job_id,
+                "status": job.get("status"),
+                "progress": job.get("progress"),
+                "message": job.get("message"),
+                "error": job.get("error"),
+                "provider": "shotstack",
+            }
+        )
+    status = resp.get("status")
+    url = resp.get("url")
+    if status == "done" and url:
+        size = 0
+        try:
+            h = requests.head(url, timeout=30)
+            size = int(h.headers.get("Content-Length") or 0)
+        except Exception:
+            pass
+        fname = "translated-%s.mp4" % (job.get("targetLanguage") or "video")
+        _set_job(job_id, status="done", progress=100, message="Ready", outputUrl=url, size=size, downloadFilename=fname)
+        return jsonify(
+            {
+                "jobId": job_id,
+                "status": "done",
+                "progress": 100,
+                "message": "Ready",
+                "hasVideo": True,
+                "size": size,
+                "url": url,
+                "downloadFilename": fname,
+                "provider": "shotstack",
+            }
+        )
+    if status == "failed":
+        err = resp.get("error") or "Shotstack render failed"
+        _set_job(job_id, status="error", error=err, progress=100)
+        return jsonify({"jobId": job_id, "status": "error", "error": err, "provider": "shotstack"})
+    if status in ("queued", "fetching", "preprocessing"):
+        _set_job(job_id, progress=55, message="Shotstack preparing (%s)" % status)
+    elif status in ("rendering", "saving"):
+        _set_job(job_id, progress=70, message="Shotstack rendering")
+    return jsonify(
+        {
+            "jobId": job_id,
+            "status": "processing",
+            "progress": job.get("progress"),
+            "message": job.get("message"),
+            "provider": "shotstack",
+            "shotstackStatus": status,
+        }
+    )
+
+
 # ---------------------------------------------------------------- Routing
 
 # --- Canonical endpoint normalization (slash vs hyphen, with id suffix) ---
-_VIDEO_BASES = ["video/capabilities", "video/upload", "video/process", "video/status", "video/download"]
+_VIDEO_BASES = ["video/capabilities", "video/upload", "video/process", "video/status", "video/download", "video/shotstack-render", "video/shotstack-status"]
 
 def _canonical_endpoint(raw: str) -> str:
     s = (raw or "").strip().strip("/").lower()
@@ -1494,6 +2015,10 @@ _HANDLERS = {
     "video-status": handle_video_status,
     "video/download": handle_video_download,
     "video-download": handle_video_download,
+    "video/shotstack-render": handle_shotstack_render,
+    "video-shotstack-render": handle_shotstack_render,
+    "video/shotstack-status": handle_shotstack_status,
+    "video-shotstack-status": handle_shotstack_status,
 }
 
 
@@ -1519,6 +2044,7 @@ def dispatch(_path):
         "video/capabilities", "video-capabilities",
         "video/status", "video-status",
         "video/download", "video-download",
+        "video/shotstack-status", "video-shotstack-status",
     }
     if name in _GET_ONLY:
         if request.method != "GET":

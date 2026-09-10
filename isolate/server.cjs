@@ -946,12 +946,9 @@ async function processVideoJob(jobId) {
     const stereo = (aStream?.channels || 0) >= 2;
     const applyCenterCancel = job.removeVocals === true && stereo;
     if (hasAudio) {
+      const bgGain = typeof job.bgGain === "number" && job.bgGain !== 1 ? `,volume=${job.bgGain.toFixed(3)}` : "";
       filters.push(
-        applyCenterCancel ? "[0:a]aformat=channel_layouts=stereo,pan=stereo|c0=c0-c1|c1=c1-c0[bg0]" : "[0:a]aformat=channel_layouts=stereo[bg0]"
-      );
-      const cond = clips.map((c) => `between(t,${c.start.toFixed(2)},${c.end.toFixed(2)})`).join("+");
-      filters.push(
-        cond ? `[bg0]volume='if(${cond}>=1,0.45,1)':eval=frame[bg]` : "[bg0]anull[bg]"
+        applyCenterCancel ? `[0:a]aformat=channel_layouts=stereo,aresample=48000,pan=stereo|c0=c0-c1|c1=c1-c0${bgGain}[bg0]` : `[0:a]aformat=channel_layouts=stereo,aresample=48000${bgGain}[bg0]`
       );
     }
     const buildAtempo = (rate) => {
@@ -972,34 +969,62 @@ async function processVideoJob(jobId) {
       parts.push(`atempo=${r.toFixed(4)}`);
       return "," + parts.join(",");
     };
+    const buildClipChain = (segDur, rawRate, start) => {
+      const clampedRate = Math.min(Math.max(rawRate, 0.5), 4);
+      const delayMs = Math.max(0, Math.round(start * 1e3));
+      const vGain = typeof job.voiceGain === "number" && job.voiceGain !== 1 ? `volume=${job.voiceGain.toFixed(3)},` : "";
+      let chain = `${vGain}aformat=channel_layouts=stereo`;
+      chain += buildAtempo(clampedRate);
+      chain += `,aresample=48000:async=1:min_hard_comp=0.100000,apad,atrim=start=0:duration=${segDur.toFixed(3)}`;
+      if (segDur > 0.25) {
+        const fadeOutStart = Math.max(0, segDur - 0.1);
+        chain += `,afade=t=in:st=0:d=0.03,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.1`;
+      }
+      chain += `,adelay=${delayMs}|${delayMs}`;
+      return chain;
+    };
     clips.forEach((c, i) => {
       const segDur = Math.max(c.end - c.start, 0.4);
       const rawRate = c.duration / segDur;
-      const clampedRate = Math.min(Math.max(rawRate, 0.5), 4);
-      const delayMs = Math.max(0, Math.round(c.start * 1e3));
-      let chain = "aformat=channel_layouts=stereo";
-      chain += buildAtempo(clampedRate);
-      chain += `,aresample=48000:async=1:min_hard_comp=0.100000,apad,atrim=start=0:duration=${segDur.toFixed(3)}`;
-      chain += `,adelay=${delayMs}|${delayMs}:all=1`;
+      const chain = buildClipChain(segDur, rawRate, c.start);
       filters.push(`[${i + 1}:a]${chain}[v${i}]`);
     });
+    let vc = null;
+    if (clips.length > 0) {
+      const mkBus = (tag) => {
+        const inputs = clips.map((_, i) => `[${tag}${i}]`);
+        if (inputs.length === 1) {
+          filters.push(`${inputs[0]}anull[${tag}c]`);
+          return `[${tag}c]`;
+        }
+        filters.push(`${inputs.join("")}amix=inputs=${inputs.length}:duration=longest:dropout_transition=0:normalize=0,aresample=48000[${tag}c]`);
+        return `[${tag}c]`;
+      };
+      vc = mkBus("v");
+    }
     let aout = null;
     if (hasAudio) {
-      const inputs = ["[bg]", ...clips.map((_, i) => `[v${i}]`)];
-      if (inputs.length === 1) {
-        aout = "[bg]";
-      } else {
-        filters.push(`${inputs.join("")}amix=inputs=${inputs.length}:duration=first:dropout_transition=0:normalize=0,aresample=48000[aout]`);
+      if (vc) {
+        const duckLevel = { light: 0.75, normal: 1, deep: 1 }[job.duckDepth || "normal"] ?? 1;
+        const pre = 0.08;
+        const post = 0.15;
+        const fade = 0.08;
+        const terms = clips.map((c) => {
+          const s = Math.max(0, c.start - pre);
+          const e = Math.max(c.end + post, s + 0.4);
+          return `min(1,max(0,min((t-${s.toFixed(3)})/${fade.toFixed(3)},(${e.toFixed(3)}-t)/${fade.toFixed(3)})))`;
+        });
+        const duckExpr = `1-${duckLevel}*min(1,${terms.join("+")})`;
+        filters.push(`[bg0]volume='${duckExpr}':eval=frame[bg]`);
+        filters.push("[bg][vc]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,aresample=48000,alimiter=limit=0.95:level=false[aout]");
         aout = "[aout]";
+      } else {
+        filters.push("[bg0]anull[bg]");
+        aout = "[bg]";
       }
     } else if (clips.length > 0) {
-      const inputs = clips.map((_, i) => `[v${i}]`);
-      if (inputs.length === 1) {
-        aout = inputs[0];
-      } else {
-        filters.push(`${inputs.join("")}amix=inputs=${inputs.length}:duration=longest:dropout_transition=0:normalize=0,aresample=48000[aout]`);
-        aout = "[aout]";
-      }
+      filters.push("[vc]alimiter=limit=0.95:level=false[aout]");
+      aout = "[aout]";
     }
     const isVideo = Boolean(vStream);
     const outputPath = (0, import_path.join)(jobDir, "output.mp4");
@@ -1057,10 +1082,10 @@ async function processVideoJob(jobId) {
   }
 }
 app.get("/api/video/capabilities", (_req, res) => {
-  res.json({ ffmpeg: FFMPEG_AVAILABLE, chunked: false, maxUploadBytes: VIDEO_UPLOAD_LIMIT });
+  res.json({ ffmpeg: FFMPEG_AVAILABLE, shotstack: Boolean(SHOTSTACK_API_KEY), chunked: false, maxUploadBytes: VIDEO_UPLOAD_LIMIT });
 });
 app.post("/api/video/upload", videoUpload.single("video"), async (req, res) => {
-  if (!FFMPEG_AVAILABLE) {
+  if (!FFMPEG_AVAILABLE && !SHOTSTACK_API_KEY) {
     res.status(501).json({ error: "FFmpeg is not installed on the server \u2014 MP4 generation is unavailable." });
     return;
   }
@@ -1097,7 +1122,7 @@ app.post("/api/video/upload", videoUpload.single("video"), async (req, res) => {
   }
 });
 app.post("/api/video/process", import_express.default.json({ limit: "80mb" }), async (req, res) => {
-  const { jobId, segments, removeVocals = true, targetLanguage = "km" } = req.body || {};
+  const { jobId, segments, removeVocals = true, targetLanguage = "km", voiceGain = 1, bgGain = 1, duckDepth = "normal" } = req.body || {};
   const job = videoJobs.get(jobId);
   if (!job) {
     res.status(404).json({ error: "Unknown jobId \u2014 please upload the video again." });
@@ -1118,6 +1143,11 @@ app.post("/api/video/process", import_express.default.json({ limit: "80mb" }), a
   job.segments = segments;
   job.removeVocals = Boolean(removeVocals);
   job.targetLanguage = String(targetLanguage || "km");
+  const vGain = Number(voiceGain);
+  const bGain = Number(bgGain);
+  job.voiceGain = Number.isFinite(vGain) && vGain >= 0 && vGain <= 2 ? vGain : 1;
+  job.bgGain = Number.isFinite(bGain) && bGain >= 0 && bGain <= 1 ? bGain : 1;
+  job.duckDepth = ["light", "normal", "deep"].includes(String(duckDepth)) ? String(duckDepth) : "normal";
   job.status = "processing";
   job.progress = 10;
   job.message = "Preparing";
@@ -1157,6 +1187,306 @@ app.get("/api/video/download/:id", async (req, res) => {
     (0, import_fs.createReadStream)(job.outputPath).pipe(res);
   } catch (err) {
     res.status(500).json({ error: err?.message || "Download failed" });
+  }
+});
+var SHOTSTACK_ENV_VAR = "SHOTSTACK_API_KEY";
+var SHOTSTACK_API_KEY = process.env[SHOTSTACK_ENV_VAR]?.trim() || "";
+var SHOTSTACK_INGEST_BASE = "https://api.shotstack.io/ingest/stage";
+var SHOTSTACK_EDIT_BASE = "https://api.shotstack.io/edit/stage";
+var shotstackRenders = /* @__PURE__ */ new Map();
+async function shotstackIngestUpload(filePath, filename) {
+  if (!SHOTSTACK_API_KEY) throw new Error("SHOTSTACK_API_KEY is not configured on the server");
+  const headers = { Accept: "application/json", "x-api-key": SHOTSTACK_API_KEY };
+  const upRes = await fetch(`${SHOTSTACK_INGEST_BASE}/upload`, {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ filename })
+  });
+  if (!upRes.ok) throw new Error(`Shotstack upload init failed (${upRes.status})`);
+  const upJson = await upRes.json();
+  const upId = upJson.data?.id;
+  const signed = upJson.data?.attributes?.url;
+  if (!upId || !signed) throw new Error("Shotstack upload init returned no signed URL");
+  const buf = await (0, import_promises.readFile)(filePath);
+  const low = filename.toLowerCase();
+  let mime = "video/mp4";
+  if (low.endsWith(".wav")) mime = "audio/wav";
+  else if (low.endsWith(".mp3")) mime = "audio/mpeg";
+  else if (low.endsWith(".m4a") || low.endsWith(".aac")) mime = "audio/mp4";
+  else if (low.endsWith(".webm")) mime = "video/webm";
+  else if (low.endsWith(".mov")) mime = "video/quicktime";
+  const putRes = await fetch(signed, { method: "PUT", headers: { "Content-Type": mime }, body: buf });
+  if (!putRes.ok) throw new Error(`Shotstack upload failed (${putRes.status})`);
+  const deadline = Date.now() + 18e4;
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch(`${SHOTSTACK_INGEST_BASE}/sources/${upId}`, { headers });
+      if (r.ok) {
+        const j = await r.json();
+        const st = j.data?.attributes?.status;
+        if (st === "ready") return j.data.attributes.source;
+        if (st === "failed") throw new Error("Shotstack ingest failed");
+      }
+    } catch (err) {
+      if (err?.message === "Shotstack ingest failed") throw err;
+    }
+    await new Promise((res) => setTimeout(res, 3e3));
+  }
+  throw new Error("Shotstack ingest timed out");
+}
+async function shotstackStartRender(jobId) {
+  const job = videoJobs.get(jobId);
+  if (!job || !job.inputPath) {
+    if (job) {
+      job.status = "error";
+      job.error = "Job not found";
+      job.progress = 100;
+    }
+    return;
+  }
+  try {
+    setJobProgress(jobId, 15, "Uploading to Shotstack");
+    const jobDir = (0, import_path.join)(JOBS_ROOT, jobId);
+    const originalName = job.inputPath.split(/[\\/]/).pop() || "original.mp4";
+    const originalUrl = await shotstackIngestUpload(job.inputPath, originalName);
+    const segs = job.segments || [];
+    const withAudio = segs.filter((s) => (s.dubbedAudioBase64 || "").length > 100);
+    const clips = [];
+    for (let i = 0; i < withAudio.length; i++) {
+      try {
+        const seg = withAudio[i];
+        const buf = Buffer.from(seg.dubbedAudioBase64 || "", "base64");
+        if (buf.length < 100) continue;
+        const kind = sniffAudioKind(buf);
+        const clipPath = (0, import_path.join)(JOBS_ROOT, jobId, `shotstack_clip_${String(i).padStart(4, "0")}.${kind}`);
+        await (0, import_promises.writeFile)(clipPath, buf);
+        const url = await shotstackIngestUpload(clipPath, clipPath.split(/[\\/]/).pop() || "clip.wav");
+        clips.push({ start: Math.max(0, seg.start), end: Math.max(seg.end, seg.start + 0.3), url });
+      } catch (err) {
+        console.warn(`[Shotstack] clip ${i} failed:`, err?.message);
+      }
+      setJobProgress(jobId, 15 + Math.round(20 * ((i + 1) / Math.max(withAudio.length, 1))), `Uploading voice clips (${i + 1}/${withAudio.length})`);
+    }
+    let duration = Math.max(...clips.map((c) => c.end), 0);
+    if (duration <= 0) duration = Math.max(...segs.map((s) => s.end || 0), 0);
+    duration = Math.max(duration + 1, 3);
+    const removeVocals = job.removeVocals === true;
+    const bgGain = typeof job.bgGain === "number" ? job.bgGain : 1;
+    const voiceGain = typeof job.voiceGain === "number" ? job.voiceGain : 1;
+    const duckDepth = ["light", "normal", "deep"].includes(job.duckDepth) ? job.duckDepth : "normal";
+    const DUCK_GAIN = { light: 0.35, normal: 0, deep: 0 };
+    const DUCK_PAD = { light: 0.15, normal: 0.3, deep: 0.45 };
+    const duckGain = DUCK_GAIN[duckDepth];
+    let bgUrl = null;
+    if (removeVocals && FFMPEG_AVAILABLE) {
+      try {
+        const { stdout } = await execFileAsync(
+          "ffprobe",
+          ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=channels", "-of", "json", job.inputPath],
+          { timeout: 2e4 }
+        );
+        const ch = JSON.parse(stdout).streams?.[0]?.channels || 0;
+        if (ch >= 2) {
+          const bgPath = (0, import_path.join)(jobDir, "shotstack_bg.wav");
+          await runFfmpegWithProgress(
+            [
+              "-y",
+              "-i",
+              job.inputPath,
+              "-af",
+              `aformat=channel_layouts=stereo,aresample=48000,pan=stereo|c0=c0-c1|c1=c1-c0,volume=${bgGain.toFixed(3)}`,
+              "-c:a",
+              "pcm_s16le",
+              "-t",
+              duration.toFixed(3),
+              bgPath
+            ],
+            duration,
+            () => {
+            },
+            6e5
+          );
+          const st = await (0, import_promises.stat)(bgPath).catch(() => null);
+          if (st && st.size > 2e3) {
+            bgUrl = await shotstackIngestUpload(bgPath, bgPath.split(/[\\/]/).pop() || "bg_music.wav");
+          }
+        }
+      } catch (err) {
+        console.warn("[Shotstack] background separation failed:", err?.message || err);
+      }
+    }
+    const tracks = [
+      {
+        clips: [
+          {
+            asset: { type: "video", src: originalUrl, volume: 0 },
+            start: 0,
+            length: duration
+          }
+        ]
+      }
+    ];
+    if (clips.length > 0) {
+      const pad = DUCK_PAD[duckDepth];
+      const ranges = clips.map((c) => [Math.max(0, c.start - pad), Math.max(c.end + pad, c.start + 0.4)]).sort((a, b) => a[0] - b[0]);
+      const merged = [];
+      for (const [s, e] of ranges) {
+        if (merged.length && s <= merged[merged.length - 1][1]) merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], e);
+        else merged.push([s, e]);
+      }
+      const gapGain = !removeVocals || bgUrl ? bgGain : 0;
+      const windows = [];
+      let cursor = 0;
+      for (const [s0, e0] of merged) {
+        const s = Math.min(Math.max(0, s0), duration);
+        const e = Math.min(Math.max(0, e0), duration);
+        if (e <= cursor) continue;
+        if (s - cursor > 0.05) windows.push([cursor, s, gapGain]);
+        if (e - s > 0.05) windows.push([s, e, duckGain]);
+        cursor = Math.max(cursor, e);
+      }
+      if (duration - cursor > 0.05) windows.push([cursor, duration, gapGain]);
+      const compact = [];
+      for (const [s, e, g] of windows) {
+        if (compact.length && Math.abs(compact[compact.length - 1][2] - g) < 1e-9 && Math.abs(compact[compact.length - 1][1] - s) < 0.05) {
+          compact[compact.length - 1][1] = e;
+        } else {
+          compact.push([s, e, g]);
+        }
+      }
+      if (bgUrl) {
+        tracks.push({
+          clips: compact.map(([s, e, g]) => ({
+            asset: { type: "audio", src: bgUrl, volume: Math.min(Math.max(g, 0), 1) },
+            start: Math.round(s * 1e3) / 1e3,
+            length: Math.round((e - s) * 1e3) / 1e3
+          }))
+        });
+      } else if (!removeVocals) {
+        for (const [s, e, g] of compact) {
+          tracks.push({
+            clips: [
+              {
+                asset: { type: "video", src: originalUrl, volume: g },
+                start: Math.round(s * 1e3) / 1e3,
+                length: Math.round((e - s) * 1e3) / 1e3
+              }
+            ]
+          });
+        }
+      }
+      tracks.push({
+        clips: clips.map((c) => ({
+          asset: { type: "audio", src: c.url, volume: Math.min(Math.max(voiceGain, 0), 1) },
+          start: c.start,
+          length: Math.max(c.end - c.start, 0.4)
+        }))
+      });
+    }
+    const edit = { timeline: { tracks, fps: 30 }, output: { format: "mp4", resolution: "sd", fps: 30 } };
+    setJobProgress(jobId, 45, "Submitting Shotstack render");
+    const res = await fetch(`${SHOTSTACK_EDIT_BASE}/render`, {
+      method: "POST",
+      headers: { ...{ Accept: "application/json", "x-api-key": SHOTSTACK_API_KEY }, "Content-Type": "application/json" },
+      body: JSON.stringify(edit)
+    });
+    if (!res.ok) throw new Error(`Shotstack render submit failed (${res.status})`);
+    const body = await res.json();
+    const rid = body.response?.id;
+    if (!rid) throw new Error("Shotstack render returned no id");
+    shotstackRenders.set(jobId, { renderId: rid, jobId });
+    setJobProgress(jobId, 50, `Shotstack rendering (${rid})`);
+    console.log(`[Shotstack] Job ${jobId} queued render ${rid}`);
+  } catch (err) {
+    console.error(`[Shotstack] Job ${jobId} failed:`, err?.message || err);
+    job.status = "error";
+    job.error = err?.message || "Shotstack render failed";
+    job.progress = 100;
+  }
+}
+app.post("/api/video/shotstack-render", import_express.default.json({ limit: "80mb" }), async (req, res) => {
+  const { jobId, segments, removeVocals = true, targetLanguage = "km", voiceGain = 1, bgGain = 1 } = req.body || {};
+  const job = videoJobs.get(jobId);
+  if (!job) {
+    res.status(404).json({ error: "Unknown jobId \u2014 please upload the video again." });
+    return;
+  }
+  if (!Array.isArray(segments) || segments.length === 0) {
+    res.status(400).json({ error: "No subtitle segments provided" });
+    return;
+  }
+  if (!SHOTSTACK_API_KEY) {
+    res.status(501).json({ error: "SHOTSTACK_API_KEY is not configured on the server" });
+    return;
+  }
+  job.segments = segments;
+  job.removeVocals = Boolean(removeVocals);
+  job.targetLanguage = String(targetLanguage || "km");
+  const vGain = Number(voiceGain);
+  const bGain = Number(bgGain);
+  job.voiceGain = Number.isFinite(vGain) && vGain >= 0 && vGain <= 2 ? vGain : 1;
+  job.bgGain = Number.isFinite(bGain) && bGain >= 0 && bGain <= 1 ? bGain : 1;
+  job.status = "processing";
+  job.progress = 10;
+  job.message = "Preparing Shotstack render";
+  job.error = void 0;
+  res.json({ jobId, status: "processing", provider: "shotstack" });
+  void shotstackStartRender(jobId);
+});
+app.get("/api/video/shotstack-status", async (req, res) => {
+  const jobId = String(req.query.jobId || "");
+  const job = videoJobs.get(jobId);
+  if (!job) {
+    res.status(404).json({ error: "Unknown jobId" });
+    return;
+  }
+  const entry = shotstackRenders.get(jobId);
+  if (!entry) {
+    res.json({ jobId, status: job.status, progress: job.progress, message: job.message, error: job.error, hasVideo: job.hasVideo, provider: "shotstack" });
+    return;
+  }
+  try {
+    const r = await fetch(`${SHOTSTACK_EDIT_BASE}/render/${entry.renderId}`, {
+      headers: { Accept: "application/json", "x-api-key": SHOTSTACK_API_KEY }
+    });
+    if (!r.ok) throw new Error(`Shotstack status failed (${r.status})`);
+    const j = await r.json();
+    const resp = j.response || {};
+    const status = resp.status;
+    const url = resp.url;
+    if (status === "done" && url) {
+      let size = 0;
+      try {
+        const h = await fetch(url, { method: "HEAD" });
+        size = Number(h.headers.get("content-length") || 0);
+      } catch {
+      }
+      const fname = `translated-${job.targetLanguage || "video"}.mp4`;
+      job.status = "done";
+      job.progress = 100;
+      job.message = "Ready";
+      job.outputPath = url;
+      job.downloadFilename = fname;
+      job.size = size;
+      res.json({ jobId, status: "done", progress: 100, message: "Ready", hasVideo: true, size, url, downloadFilename: fname, provider: "shotstack" });
+      return;
+    }
+    if (status === "failed") {
+      const err = resp.error || "Shotstack render failed";
+      job.status = "error";
+      job.error = err;
+      job.progress = 100;
+      res.json({ jobId, status: "error", error: err, provider: "shotstack" });
+      return;
+    }
+    setJobProgress(
+      jobId,
+      ["queued", "fetching", "preprocessing"].includes(status) ? 55 : 70,
+      status === "rendering" || status === "saving" ? "Shotstack rendering" : `Shotstack preparing (${status})`
+    );
+    res.json({ jobId, status: "processing", progress: job.progress, message: job.message, provider: "shotstack", shotstackStatus: status });
+  } catch (err) {
+    res.json({ jobId, status: job.status, progress: job.progress, message: job.message, error: job.error, provider: "shotstack" });
   }
 });
 function formatSrtTime(t) {

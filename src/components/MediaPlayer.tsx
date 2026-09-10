@@ -3,8 +3,6 @@ import { apiUrl } from '../utils/api';
 import {
   Play,
   Pause,
-  Volume2,
-  VolumeX,
   Maximize,
   RotateCcw,
   Subtitles,
@@ -18,14 +16,25 @@ import { isSeparableBuffer } from '../utils/vocalSeparation';
 
 import { UILang, UI_TEXT } from '../data/translations';
 
+export type DuckDepth = 'light' | 'normal' | 'deep';
+
 export interface MediaPlayerHandle {
   exportDubbed: (onProgress?: (p: number) => void) => Promise<{ blob: Blob; ext: string } | null>;
+  /** Live mix console: set AI voice gain, background gain and ducking depth. */
+  setMixLevels: (voice: number, bg: number, depth: DuckDepth) => void;
 }
 
 // Music level while the translated AI voice speaks, relative to the
 // background-music slider. The live preview and the exported file share this
 // exact value so the download sounds like what the user heard while playing.
 const MUSIC_DUCK = 0.45;
+// Ducking depth presets (light / normal / deep) — how far the background dips
+// under the AI voice. Kept in sync with the server FFmpeg ducking profiles.
+const DUCK_FACTORS: Record<DuckDepth, number> = {
+  light: 0.65,
+  normal: MUSIC_DUCK,
+  deep: 0.25,
+};
 
 // --- Canvas helpers: burn CC subtitles into the exported video frame ---
 
@@ -438,6 +447,7 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
 
   const [activeDubbedEl, setActiveDubbedEl] = useState<HTMLAudioElement | null>(null);
   const [voiceVolume, setVoiceVolume] = useState(1.0); // AI voice volume
+  const [duckFactor, setDuckFactor] = useState<number>(MUSIC_DUCK); // ducking depth
   const lastSpokenSegmentIdRef = useRef<number | null>(null);
   const dubbedAudioRef = useRef<HTMLAudioElement | null>(null);
   const currentTimeRef = useRef<number>(0); // Always-fresh playback time for accurate sync
@@ -530,9 +540,9 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
     if (!el || isMuted) return;
     el.volume =
       activeSegment && activeSegment.dubbedAudioBase64
-        ? bgVolume * MUSIC_DUCK
+        ? bgVolume * duckFactor
         : bgVolume;
-  }, [isAiVoiceDubbing, isPlaying, activeSegment, bgVolume, isMuted, mediaPlayerRef]);
+  }, [isAiVoiceDubbing, isPlaying, activeSegment, bgVolume, duckFactor, isMuted, mediaPlayerRef]);
 
   // Play pre-generated dubbed audio segment with precise timing sync
   // Rate is calculated from REMAINING segment time so speech fits the video exactly
@@ -686,24 +696,6 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
     if (isAiVoiceDubbing) {
       stopSpeaking();
       lastSpokenSegmentIdRef.current = null;
-    }
-  };
-
-  const toggleMute = () => {
-    const el = mediaPlayerRef.current;
-    if (!el) return;
-    if (isMuted) {
-      // Unmute
-      el.muted = false;
-      el.volume = isAiVoiceDubbing ? bgVolume : 1.0;
-      setIsMuted(false);
-    } else {
-      // Mute
-      el.muted = true;
-      setIsMuted(true);
-    }
-    if (setMuteOriginal) {
-      setMuteOriginal(!isMuted);
     }
   };
 
@@ -1050,8 +1042,8 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
         const bg = bgGain.gain;
         try {
           bg.setValueAtTime(bgVolume, Math.max(sAt - 0.08, ctx.currentTime));
-          bg.linearRampToValueAtTime(bgVolume * MUSIC_DUCK, sAt + 0.06);
-          bg.setValueAtTime(bgVolume * MUSIC_DUCK, sEnd);
+          bg.linearRampToValueAtTime(bgVolume * duckFactor, sAt + 0.06);
+          bg.setValueAtTime(bgVolume * duckFactor, sEnd);
           bg.linearRampToValueAtTime(bgVolume, sEnd + 0.25);
         } catch { /* automation overlap — non-fatal */ }
       }
@@ -1161,6 +1153,11 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
 
   useImperativeHandle(ref, () => ({
     exportDubbed: (onProgress?: (p: number) => void) => exportDubbedInternal(onProgress),
+    setMixLevels: (voice: number, bg: number, depth: DuckDepth) => {
+      setVoiceVolume(Math.min(Math.max(voice, 0), 2));
+      setBgVolume(Math.min(Math.max(bg, 0), 1));
+      setDuckFactor(DUCK_FACTORS[depth] ?? MUSIC_DUCK);
+    },
   }));
 
   if (!mediaUrl) {
@@ -1303,16 +1300,6 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
               <RotateCcw className="w-4 h-4" />
             </button>
 
-            <button
-              id="player-toggle-mute"
-              type="button"
-              onClick={toggleMute}
-              className="p-1.5 sm:p-2 rounded-lg text-stone-400 hover:text-white hover:bg-stone-800 transition-colors"
-              title={isMuted ? 'Unmute' : 'Mute'}
-            >
-              {isMuted ? <VolumeX className="w-4 h-4 text-rose-400" /> : <Volume2 className="w-4 h-4" />}
-            </button>
-
             {/* AI Voice Dubbing Toggle (compact) */}
             <button
               id="player-toggle-ai-dubbing"
@@ -1443,30 +1430,6 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
               />
               <span className="text-[10px] font-mono text-orange-400 w-8">
                 {Math.round(voiceVolume * 100)}%
-              </span>
-            </div>
-            {/* Background Music Volume */}
-            <div className="flex items-center gap-1.5 flex-1 min-w-[130px]">
-              <Music className="w-3.5 h-3.5 text-purple-400 shrink-0" />
-              <input
-                id="bg-volume-slider"
-                type="range"
-                min="0"
-                max="100"
-                value={Math.round(bgVolume * 100)}
-                onChange={(e) => {
-                  const vol = parseInt(e.target.value) / 100;
-                  setBgVolume(vol);
-                  const el = mediaPlayerRef.current;
-                  if (el && isAiVoiceDubbing) {
-                    el.volume = activeSegment?.dubbedAudioBase64 ? vol * 0.3 : vol;
-                  }
-                }}
-                className="flex-1 max-w-[80px] h-1 accent-purple-500"
-                title={`Background Music: ${Math.round(bgVolume * 100)}%`}
-              />
-              <span className="text-[10px] font-mono text-purple-400 w-8">
-                {Math.round(bgVolume * 100)}%
               </span>
             </div>
           </div>

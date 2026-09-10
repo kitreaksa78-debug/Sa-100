@@ -30,6 +30,8 @@ interface ExportToolbarProps {
   /** Smart export: strip original voice, keep only music + translated voice. */
   removeVocalsOnExport: boolean;
   setRemoveVocalsOnExport: (v: boolean) => void;
+  /** 'edit' = show only the AI-voice tools; 'render' = full export console. */
+  mode?: 'edit' | 'render';
 }
 
 export const ExportToolbar: React.FC<ExportToolbarProps> = ({
@@ -48,7 +50,9 @@ export const ExportToolbar: React.FC<ExportToolbarProps> = ({
   exportStep,
   removeVocalsOnExport,
   setRemoveVocalsOnExport,
+  mode = 'render',
 }) => {
+  const isEditMode = mode === 'edit';
   const t = UI_TEXT[uiLang];
   const [copied, setCopied] = useState(false);
   const [quickTargetLang, setQuickTargetLang] = useState(result.targetLanguage || 'en');
@@ -102,7 +106,7 @@ export const ExportToolbar: React.FC<ExportToolbarProps> = ({
       </div>
 
       {/* Primary Actions: AI Voice + Export Video */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+      <div className={isEditMode ? 'grid grid-cols-1 gap-2' : 'grid grid-cols-1 sm:grid-cols-2 gap-2'}>
         {/* Generate AI Voice Dubbing Button */}
         <button
           id="generate-ai-dubbing-btn"
@@ -134,6 +138,7 @@ export const ExportToolbar: React.FC<ExportToolbarProps> = ({
         </button>
 
         {/* Export Dubbed Media Button — records the media + AI voice mix in real-time */}
+        {!isEditMode && (
         <button
           id="export-dubbed-video-btn"
           type="button"
@@ -163,9 +168,11 @@ export const ExportToolbar: React.FC<ExportToolbarProps> = ({
               : exportLabel}
           </span>
         </button>
+        )}
       </div>
 
       {/* Smart mixing toggle: original voice removed, music kept */}
+      {!isEditMode && (
       <label
         id="remove-vocals-toggle"
         className="flex items-center gap-2.5 rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-2 cursor-pointer select-none"
@@ -185,6 +192,7 @@ export const ExportToolbar: React.FC<ExportToolbarProps> = ({
           {t.keepMusicToggleHint}
         </span>
       </label>
+      )}
 
       {/* Progress bars while busy */}
       {(isGeneratingDubbing || isExportingDubbed) && (

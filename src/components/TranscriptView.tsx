@@ -2,14 +2,15 @@ import React, { useState } from 'react';
 import {
   Play,
   Volume2,
-  VolumeX,
   Edit2,
   Check,
   X,
   Search,
   Languages,
-  Sparkles,
-  Layers,
+  Scissors,
+  Trash2,
+  RefreshCw,
+  Clock,
 } from 'lucide-react';
 import { SubtitleSegment, ViewMode } from '../types';
 import { UILang, UI_TEXT } from '../data/translations';
@@ -22,6 +23,16 @@ interface TranscriptViewProps {
   onSeek: (time: number) => void;
   uiLang: UILang;
   targetLangCode: string;
+  /** Delete one segment (removed from transcript + render). */
+  onDeleteSegment: (id: number) => void;
+  /** Split a segment in two at the given timestamp. */
+  onSplitSegment: (id: number, atTime: number) => void;
+  /** Update a segment's start/end times. */
+  onUpdateSegmentTimes: (id: number, start: number, end: number) => void;
+  /** Regenerate AI voice for one segment via the backend TTS. */
+  onRedubSegment: (id: number) => void;
+  /** Segment currently being re-dubbed (spinner). */
+  isRedubbingId: number | null;
 }
 
 export const TranscriptView: React.FC<TranscriptViewProps> = ({
@@ -31,6 +42,11 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
   onSeek,
   uiLang,
   targetLangCode,
+  onDeleteSegment,
+  onSplitSegment,
+  onUpdateSegmentTimes,
+  onRedubSegment,
+  isRedubbingId,
 }) => {
   const t = UI_TEXT[uiLang];
   const [viewMode, setViewMode] = useState<ViewMode>('split');
@@ -38,21 +54,13 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editTranslated, setEditTranslated] = useState('');
   const [editOriginal, setEditOriginal] = useState('');
-  const [speakingSegmentId, setSpeakingSegmentId] = useState<number | null>(null);
+  const [timesId, setTimesId] = useState<number | null>(null);
+  const [timeStart, setTimeStart] = useState('0');
+  const [timeEnd, setTimeEnd] = useState('1');
 
   const handleSpeakSegment = (segId: number, text: string) => {
-    if (speakingSegmentId === segId) {
-      stopSpeaking();
-      setSpeakingSegmentId(null);
-    } else {
-      setSpeakingSegmentId(segId);
-      speakText(
-        text,
-        targetLangCode,
-        () => setSpeakingSegmentId(null),
-        () => setSpeakingSegmentId(null)
-      );
-    }
+    if (segments.find((s) => s.id === segId)?.dubbedAudioBase64) return;
+    if (text.trim()) speakText(text, targetLangCode);
   };
 
   const startEditing = (seg: SubtitleSegment) => {
@@ -75,6 +83,20 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
     setEditingId(null);
   };
 
+  const openTimes = (seg: SubtitleSegment) => {
+    setTimesId(timesId === seg.id ? null : seg.id);
+    setTimeStart(String(seg.start));
+    setTimeEnd(String(seg.end));
+  };
+
+  const applyTimes = (segId: number) => {
+    const start = parseFloat(timeStart);
+    const end = parseFloat(timeEnd);
+    if (isNaN(start) || isNaN(end) || start < 0 || end <= start) return;
+    onUpdateSegmentTimes(segId, start, end);
+    setTimesId(null);
+  };
+
   // Filtered segments based on search
   const filteredSegments = segments.filter((seg) => {
     if (!searchQuery.trim()) return true;
@@ -85,7 +107,7 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
   });
 
   return (
-    <div className="bg-white rounded-2xl border border-stone-200 shadow-xs flex flex-col h-[360px] sm:h-[480px] lg:h-[520px] overflow-hidden">
+    <div className="bg-white rounded-2xl border border-stone-200 shadow-xs flex flex-col h-[440px] sm:h-[520px] lg:h-[560px] overflow-hidden">
       {/* Top Header with view toggles & search */}
       <div className="p-3.5 border-b border-stone-100 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 bg-stone-50/50">
         {/* View Mode Switcher */}
@@ -157,6 +179,8 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
           filteredSegments.map((seg) => {
             const isActive = currentTime >= seg.start && currentTime <= seg.end;
             const isEditing = editingId === seg.id;
+            const hasDub = Boolean(seg.dubbedAudioBase64);
+            const isRedubbing = isRedubbingId === seg.id;
 
             return (
               <div
@@ -170,7 +194,7 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
               >
                 {/* Header row: timecode & quick buttons */}
                 <div className="flex items-center justify-between gap-2 mb-1.5">
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-1.5 min-w-0">
                     <button
                       id={`seek-to-seg-${seg.id}`}
                       type="button"
@@ -188,19 +212,72 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
                       <span>{formatTimeCode(seg.end)}</span>
                     </button>
 
-                    <span className="text-[10px] text-stone-400 font-mono">#{seg.id}</span>
+                    {hasDub && (
+                      <span
+                        title={t.aiVoiceReady}
+                        className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0"
+                      />
+                    )}
                   </div>
 
                   {/* Actions for this segment */}
-                  <div className="flex items-center gap-1 opacity-80 group-hover:opacity-100">
+                  <div className="flex items-center gap-0.5 opacity-80 group-hover:opacity-100">
                     <button
                       id={`tts-listen-seg-${seg.id}`}
                       type="button"
-                      onClick={() => speakText(seg.translatedText, targetLangCode)}
+                      onClick={() => handleSpeakSegment(seg.id, seg.translatedText)}
                       className="p-1 rounded text-stone-400 hover:text-orange-600 hover:bg-stone-100"
                       title={t.listenAudio}
                     >
                       <Volume2 className="w-3.5 h-3.5" />
+                    </button>
+
+                    {/* Re-dub single segment (real backend TTS) */}
+                    <button
+                      id={`redub-seg-${seg.id}`}
+                      type="button"
+                      onClick={() => onRedubSegment(seg.id)}
+                      disabled={isRedubbing}
+                      className="p-1 rounded text-stone-400 hover:text-emerald-600 hover:bg-stone-100 disabled:opacity-40"
+                      title={t.redubSegment}
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isRedubbing ? 'animate-spin text-emerald-600' : ''}`} />
+                    </button>
+
+                    {/* Split at playhead */}
+                    <button
+                      id={`split-seg-${seg.id}`}
+                      type="button"
+                      onClick={() => onSplitSegment(seg.id, currentTime)}
+                      disabled={!(currentTime > seg.start + 0.4 && currentTime < seg.end - 0.4)}
+                      className="p-1 rounded text-stone-400 hover:text-indigo-600 hover:bg-stone-100 disabled:opacity-30"
+                      title={t.splitSegment}
+                    >
+                      <Scissors className="w-3.5 h-3.5" />
+                    </button>
+
+                    {/* Edit timing */}
+                    <button
+                      id={`times-seg-${seg.id}`}
+                      type="button"
+                      onClick={() => openTimes(seg)}
+                      className={`p-1 rounded hover:bg-stone-100 ${
+                        timesId === seg.id ? 'text-indigo-600' : 'text-stone-400 hover:text-indigo-600'
+                      }`}
+                      title={t.editTimes}
+                    >
+                      <Clock className="w-3.5 h-3.5" />
+                    </button>
+
+                    {/* Delete segment */}
+                    <button
+                      id={`delete-seg-${seg.id}`}
+                      type="button"
+                      onClick={() => onDeleteSegment(seg.id)}
+                      className="p-1 rounded text-stone-400 hover:text-rose-600 hover:bg-stone-100"
+                      title={t.deleteSegment}
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
                     </button>
 
                     {!isEditing && (
@@ -216,6 +293,57 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
                     )}
                   </div>
                 </div>
+
+                {/* Edit timing row */}
+                {timesId === seg.id && (
+                  <div className="mt-2 flex flex-wrap items-end gap-2 bg-white p-2.5 rounded-lg border border-indigo-200">
+                    <label className="flex-1 min-w-[110px]">
+                      <span className="text-[10px] font-semibold text-stone-500 uppercase tracking-wider block mb-0.5">
+                        {t.timeStartLbl}
+                      </span>
+                      <input
+                        id={`time-start-${seg.id}`}
+                        type="number"
+                        min="0"
+                        step="0.1"
+                        value={timeStart}
+                        onChange={(e) => setTimeStart(e.target.value)}
+                        className="w-full px-2 py-1 text-xs font-mono border border-stone-200 rounded-lg focus:ring-1 focus:ring-indigo-500"
+                      />
+                    </label>
+                    <label className="flex-1 min-w-[110px]">
+                      <span className="text-[10px] font-semibold text-stone-500 uppercase tracking-wider block mb-0.5">
+                        {t.timeEndLbl}
+                      </span>
+                      <input
+                        id={`time-end-${seg.id}`}
+                        type="number"
+                        min="0"
+                        step="0.1"
+                        value={timeEnd}
+                        onChange={(e) => setTimeEnd(e.target.value)}
+                        className="w-full px-2 py-1 text-xs font-mono border border-stone-200 rounded-lg focus:ring-1 focus:ring-indigo-500"
+                      />
+                    </label>
+                    <div className="flex items-center gap-1.5 pb-0.5">
+                      <button
+                        type="button"
+                        onClick={() => setTimesId(null)}
+                        className="px-2.5 py-1 text-xs text-stone-500 hover:bg-stone-100 rounded-md"
+                      >
+                        {t.cancel}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => applyTimes(seg.id)}
+                        className="px-3 py-1 text-xs font-semibold bg-indigo-600 text-white hover:bg-indigo-700 rounded-md flex items-center gap-1"
+                      >
+                        <Check className="w-3 h-3" />
+                        {t.saveChanges}
+                      </button>
+                    </div>
+                  </div>
+                )}
 
                 {/* Edit Form or Text Display */}
                 {isEditing ? (
@@ -286,6 +414,13 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
                       </p>
                     )}
                   </div>
+                )}
+
+                {isRedubbing && (
+                  <p className="mt-1.5 text-[10px] text-emerald-700 font-semibold flex items-center gap-1">
+                    <RefreshCw className="w-3 h-3 animate-spin" />
+                    {t.redubbingSegment}
+                  </p>
                 )}
               </div>
             );

@@ -136,7 +136,7 @@ export default function App() {
   const [duckDepth, setDuckDepth] = useState<'light' | 'normal' | 'deep'>('normal');
 
   // Render provider: 'shotstack' = Shotstack cloud (sandbox key), 'ffmpeg' = server FFmpeg.
-  const [renderProvider, setRenderProvider] = useState<'ffmpeg' | 'shotstack'>('shotstack');
+  const [renderProvider, setRenderProvider] = useState<'ffmpeg' | 'shotstack'>('ffmpeg');
 
   // Server-side MP4 generation state (real FFmpeg job — no browser recording)
   const [isExportingDubbed, setIsExportingDubbed] = useState(false);
