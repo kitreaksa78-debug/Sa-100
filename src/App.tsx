@@ -1148,6 +1148,9 @@ export default function App() {
                     <div className="min-w-0">
                       <h3 className="text-xs font-bold text-stone-800">
                         {mediaType === 'audio' ? t.renderedTitleAudio : t.renderedTitle}
+                        <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded-md bg-emerald-100 text-emerald-700 text-[9px] font-extrabold uppercase border border-emerald-200 align-middle">
+                          {t.freeBadge}
+                        </span>
                       </h3>
                       <p className="text-[11px] text-stone-500 font-mono truncate">
                         {exportedResult.filename} · {(exportedResult.size / (1024 * 1024)).toFixed(2)} MB
