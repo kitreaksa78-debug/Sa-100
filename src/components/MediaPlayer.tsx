@@ -1412,28 +1412,7 @@ export const MediaPlayer = React.forwardRef<MediaPlayerHandle, MediaPlayerProps>
           </div>
         )}
 
-        {/* Volume Sliders Row (when dubbing is ON) */}
-        {isAiVoiceDubbing && (
-          <div className="flex items-center gap-3 pt-1.5 border-t border-stone-800 mt-1 flex-wrap">
-            {/* AI Voice Volume */}
-            <div className="flex items-center gap-1.5 flex-1 min-w-[130px]">
-              <Radio className="w-3.5 h-3.5 text-orange-400 shrink-0" />
-              <input
-                id="ai-voice-volume-slider"
-                type="range"
-                min="0"
-                max="100"
-                value={Math.round(voiceVolume * 100)}
-                onChange={(e) => setVoiceVolume(parseInt(e.target.value) / 100)}
-                className="flex-1 max-w-[110px] h-1.5 accent-orange-500"
-                title={`AI Voice: ${Math.round(voiceVolume * 100)}%`}
-              />
-              <span className="text-[10px] font-mono text-orange-400 w-8">
-                {Math.round(voiceVolume * 100)}%
-              </span>
-            </div>
-          </div>
-        )}
+
       </div>
     </div>
   );
