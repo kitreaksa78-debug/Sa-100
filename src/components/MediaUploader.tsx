@@ -41,6 +41,20 @@ export const MediaUploader: React.FC<MediaUploaderProps> = ({
   const t = UI_TEXT[uiLang];
   const [activeTab, setActiveTab] = useState<'upload' | 'record' | 'sample'>('upload');
   const [isDragging, setIsDragging] = useState(false);
+  const [fileError, setFileError] = useState<string | null>(null);
+
+  // Only MP4 (video) and MP3 (audio) files are supported.
+  const isSupportedFile = (file: File): boolean => {
+    const name = (file.name || '').toLowerCase();
+    const mime = (file.type || '').toLowerCase();
+    return (
+      name.endsWith('.mp4') ||
+      name.endsWith('.mp3') ||
+      mime === 'video/mp4' ||
+      mime === 'audio/mpeg' ||
+      mime === 'audio/mp3'
+    );
+  };
 
   // Audio Recording States
   const [isRecording, setIsRecording] = useState(false);
@@ -59,8 +73,13 @@ export const MediaUploader: React.FC<MediaUploaderProps> = ({
 
   const handleFileChange = (file: File | null) => {
     if (!file) return;
+    if (!isSupportedFile(file)) {
+      setFileError(t.unsupportedFileType);
+      return;
+    }
+    setFileError(null);
     onSelectFile(file);
-    const isVideo = file.type.startsWith('video/') || /\.(mp4|webm|mov|mkv)$/i.test(file.name);
+    const isVideo = file.type === 'video/mp4' || file.name.toLowerCase().endsWith('.mp4');
     setMediaType(isVideo ? 'video' : 'audio');
     const objectUrl = URL.createObjectURL(file);
     setMediaPreviewUrl(objectUrl);
@@ -212,7 +231,7 @@ export const MediaUploader: React.FC<MediaUploaderProps> = ({
               type="file"
               id="file-upload-input"
               className="hidden"
-              accept="audio/*,video/*,.mp3,.wav,.m4a,.ogg,.flac,.mp4,.webm,.mov,.mkv"
+              accept=".mp4,.mp3,video/mp4,audio/mpeg,audio/mp3"
               onChange={(e) => {
                 if (e.target.files && e.target.files[0]) {
                   handleFileChange(e.target.files[0]);
@@ -226,6 +245,14 @@ export const MediaUploader: React.FC<MediaUploaderProps> = ({
 
             <h3 className="text-base font-bold text-stone-800 mb-1">{t.dropTitle}</h3>
             <p className="text-xs text-stone-500 mb-4 max-w-md mx-auto">{t.dropSub}</p>
+            {fileError && (
+              <p
+                id="unsupported-file-error"
+                className="mb-4 text-xs font-semibold text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2 max-w-md mx-auto"
+              >
+                {fileError}
+              </p>
+            )}
 
             <button
               type="button"

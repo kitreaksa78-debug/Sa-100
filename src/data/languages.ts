@@ -98,7 +98,7 @@ export const SAMPLE_MEDIAS: SampleMedia[] = [
     description: 'English speech explaining how Whisper neural networks decode human language.',
     descriptionKh: 'ការថ្លែងសុន្ទរកថាជាភាសាអង់គ្លេសពន្យល់ពីដំណើរការបកប្រែសំឡេងរបស់ AI។',
     type: 'audio',
-    url: '/samples/sample-tech-audio.wav',
+    url: '/samples/sample-tech-audio.mp3',
     durationSec: 4,
     initialResult: {
       detectedLanguage: 'en',
