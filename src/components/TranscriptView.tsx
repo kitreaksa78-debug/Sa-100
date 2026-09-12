@@ -11,6 +11,10 @@ import {
   Trash2,
   RefreshCw,
   Clock,
+  User,
+  Music,
+  VolumeX,
+  Sparkles,
 } from 'lucide-react';
 import { SubtitleSegment, ViewMode } from '../types';
 import { UILang, UI_TEXT } from '../data/translations';
@@ -212,10 +216,40 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
                       <span>{formatTimeCode(seg.end)}</span>
                     </button>
 
+                    {/* Speaker ID & Gender Tag */}
+                    {seg.speakerId && (
+                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-stone-100 text-stone-700 border border-stone-200">
+                        <User className="w-2.5 h-2.5 text-stone-500" />
+                        <span>{seg.speakerId}</span>
+                        {seg.speakerGender && (
+                          <span className="text-[9px] text-stone-500 lowercase">({seg.speakerGender})</span>
+                        )}
+                      </span>
+                    )}
+
+                    {/* VAD Speech vs Non-Speech Badge */}
+                    {seg.isSpeech === false ? (
+                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-50 text-amber-700 border border-amber-200">
+                        {seg.soundType === 'music' ? (
+                          <Music className="w-2.5 h-2.5" />
+                        ) : (
+                          <VolumeX className="w-2.5 h-2.5" />
+                        )}
+                        <span>{seg.soundType ? seg.soundType.toUpperCase() : 'NON-SPEECH'}</span>
+                      </span>
+                    ) : (
+                      seg.isSpeech && (
+                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
+                          <Sparkles className="w-2.5 h-2.5" />
+                          <span>SPEECH</span>
+                        </span>
+                      )
+                    )}
+
                     {hasDub && (
                       <span
                         title={t.aiVoiceReady}
-                        className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0"
+                        className="w-2 h-2 rounded-full bg-emerald-500 shrink-0"
                       />
                     )}
                   </div>

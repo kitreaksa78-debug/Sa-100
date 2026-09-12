@@ -14,11 +14,11 @@ import { createReadStream, mkdirSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { randomUUID } from "crypto";
-import { EdgeTTS } from "@travisvn/edge-tts";
+import { EdgeTTS as NodeEdgeTTS } from "node-edge-tts";
 
 const execFileAsync = promisify(execFile);
 
-const PORT = Number(process.env.PORT) || 5173;
+const PORT = 3000;
 const app = express();
 // Accepts raw uploads up to 50 MB (frontend normally shrinks larger files to
 // audio first, but allow the full claimed size in case a browser cannot).
@@ -27,9 +27,23 @@ const uploadLarge = multer({ storage: multer.memoryStorage(), limits: { fileSize
 
 // --- Server-side video job store (real FFmpeg MP4 generation) ---
 type VideoJobStatus = 'queued' | 'uploading' | 'processing' | 'done' | 'error';
+type PipelineStage =
+  | 'extract_audio'
+  | 'detect_speakers'
+  | 'detect_speech'
+  | 'transcribe'
+  | 'translate_khmer'
+  | 'generate_voices'
+  | 'sync_audio'
+  | 'mix_audio'
+  | 'render_mp4';
+
 interface VideoJob {
   id: string;
   status: VideoJobStatus;
+  currentStage?: PipelineStage | null;
+  stepNumber?: number; // 1..9
+  failedStage?: PipelineStage | null;
   progress: number; // 0..100
   message: string;
   createdAt: number;
@@ -41,19 +55,30 @@ interface VideoJob {
   hasVideo?: boolean;
   size?: number;
   targetLanguage?: string;
+  sourceLanguage?: string;
   removeVocals?: boolean;
   segments?: ProcessSegment[];
+  detectedLanguage?: string;
+  extractedAudioPath?: string;
   /** Mix console levels applied by the FFmpeg pipeline. */
   voiceGain?: number;
   bgGain?: number;
   duckDepth?: string;
 }
 interface ProcessSegment {
-  id?: number;
+  id: number;
   start: number;
   end: number;
+  originalText?: string;
   translatedText?: string;
+  isSpeech?: boolean;
+  soundType?: 'dialogue' | 'music' | 'sfx' | 'ambient' | 'noise';
+  speakerId?: string;
+  speakerName?: string;
+  speakerGender?: 'male' | 'female';
+  voiceId?: string;
   dubbedAudioBase64?: string;
+  audioDuration?: number;
 }
 const videoJobs = new Map<string, VideoJob>();
 const JOBS_ROOT = join(tmpdir(), 'video-jobs');
@@ -111,7 +136,7 @@ function rotateKeyToBack(key: string): void {
   }
 }
 
-function getAllGroqKeys(req: express.Request): string[] {
+function getAllGroqKeys(req: any): string[] {
   const keys: string[] = [];
   // User-provided key from the client takes priority
   const headerKey = req.headers["x-groq-api-key"] as string | undefined;
@@ -437,16 +462,28 @@ const EDGE_TTS_VOICES: Record<string, string> = {
   pt: "pt-PT-RaquelNeural", // Portuguese (female)
 };
 
-async function edgeTTS(text: string, lang: string): Promise<Buffer | null> {
-  const voice = EDGE_TTS_VOICES[lang];
-  if (!voice) return null;
+async function edgeTTS(
+  text: string,
+  voiceOrLang: string,
+  options?: { rate?: string; pitch?: string }
+): Promise<Buffer | null> {
+  const voice = voiceOrLang.includes("-")
+    ? voiceOrLang
+    : (EDGE_TTS_VOICES[voiceOrLang] || "km-KH-PisethNeural");
+  const tmpFile = join(tmpdir(), `tts-${randomUUID()}.mp3`);
   try {
-    const tts = new EdgeTTS(text, voice);
-    const result = await tts.synthesize();
-    const audio = Buffer.from(await result.audio.arrayBuffer());
-    return audio.length > 0 ? audio : null;
+    const tts = new NodeEdgeTTS({
+      voice,
+      rate: options?.rate || "+0%",
+      pitch: options?.pitch || "+0Hz",
+    });
+    await tts.ttsPromise(text.trim(), tmpFile);
+    const buf = await readFile(tmpFile);
+    try { await unlink(tmpFile); } catch { /* noop */ }
+    return buf.length > 0 ? buf : null;
   } catch (err: any) {
-    console.warn(`[EdgeTTS] failed for ${lang}:`, err?.message);
+    console.warn(`[NodeEdgeTTS] failed for ${voice}:`, err?.message);
+    try { await unlink(tmpFile); } catch { /* noop */ }
     return null;
   }
 }
@@ -611,7 +648,7 @@ app.get("/api/list-groq-models", async (_req, res) => {
   res.json({ models: [] });
 });
 
-app.post("/api/transcribe-and-translate", upload.single("file"), async (req, res) => {
+app.post("/api/transcribe-and-translate", upload.single("file") as any, async (req: any, res) => {
   const apiKeys = getAllGroqKeys(req);
   if (apiKeys.length === 0) {
     res.status(400).json({ error: "Groq API key is required. Please provide one in Settings or via environment.", code: "MISSING_API_KEY" });
@@ -890,7 +927,7 @@ app.post("/api/batch-tts", express.json(), async (req, res) => {
 });
 
 // --- Video Rendering: Convert WebM → MP4 (H.264 + AAC + yuv420p + faststart) ---
-app.post("/api/render-mp4", uploadLarge.single("video"), async (req, res) => {
+app.post("/api/render-mp4", uploadLarge.single("video") as any, async (req: any, res) => {
   const file = req.file;
   if (!file) {
     res.status(400).json({ error: "No video file provided" });
@@ -1287,7 +1324,7 @@ app.get('/api/video/capabilities', (_req, res) => {
   res.json({ ffmpeg: FFMPEG_AVAILABLE, shotstack: Boolean(SHOTSTACK_API_KEY), chunked: false, maxUploadBytes: VIDEO_UPLOAD_LIMIT });
 });
 
-app.post('/api/video/upload', videoUpload.single('video'), async (req, res) => {
+app.post('/api/video/upload', videoUpload.single('video') as any, async (req: any, res) => {
   if (!FFMPEG_AVAILABLE && !SHOTSTACK_API_KEY) {
     res.status(501).json({ error: 'FFmpeg is not installed on the server — MP4 generation is unavailable.' });
     return;
@@ -1381,6 +1418,704 @@ app.get('/api/video/download/:id', async (req, res) => {
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Download failed' });
   }
+});
+
+// Stream video with HTTP 206 Partial Content for instant, seekable player preview
+app.get('/api/video/stream/:id', async (req, res) => {
+  const job = videoJobs.get(req.params.id);
+  if (!job || job.status !== 'done' || !job.outputPath) {
+    res.status(404).json({ error: 'Video is not ready yet' });
+    return;
+  }
+  try {
+    const filePath = job.outputPath;
+    const fileStat = await stat(filePath);
+    const fileSize = fileStat.size;
+    const range = req.headers.range;
+
+    if (range) {
+      const parts = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const chunksize = (end - start) + 1;
+      const stream = createReadStream(filePath, { start, end });
+      res.writeHead(206, {
+        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': chunksize,
+        'Content-Type': job.hasVideo ? 'video/mp4' : 'audio/mp4',
+      });
+      stream.pipe(res);
+    } else {
+      res.writeHead(200, {
+        'Content-Length': fileSize,
+        'Content-Type': job.hasVideo ? 'video/mp4' : 'audio/mp4',
+        'Accept-Ranges': 'bytes',
+      });
+      createReadStream(filePath).pipe(res);
+    }
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Streaming failed' });
+  }
+});
+
+// --- 9-Stage AI Video Dubbing & Translation Pipeline Implementation ---
+const PIPELINE_CONFIG: { id: PipelineStage; stepNumber: number; nameKm: string; nameEn: string }[] = [
+  { id: 'extract_audio', stepNumber: 1, nameKm: 'ទាញយកសំឡេងចេញពីវីដេអូ', nameEn: 'Extracting audio' },
+  { id: 'detect_speakers', stepNumber: 2, nameKm: 'ស្វែងរក និងកំណត់តួអង្គ (Speaker Diarization)', nameEn: 'Detecting speakers' },
+  { id: 'detect_speech', stepNumber: 3, nameKm: 'ត្រួតពិនិត្យ និងច្រោះរកតែសំឡេងនិយាយពិត (VAD)', nameEn: 'Detecting speech (VAD)' },
+  { id: 'transcribe', stepNumber: 4, nameKm: 'បម្លែងសំឡេងនិយាយជាអត្ថបទ (Transcription)', nameEn: 'Transcribing speech' },
+  { id: 'translate_khmer', stepNumber: 5, nameKm: 'បកប្រែជាភាសាខ្មែរធម្មជាតិ រលូន', nameEn: 'Translating to Khmer' },
+  { id: 'generate_voices', stepNumber: 6, nameKm: 'បង្កើតសំឡេងខ្មែរតាមតួអង្គ និង segment', nameEn: 'Generating Khmer voices' },
+  { id: 'sync_audio', stepNumber: 7, nameKm: 'តម្រឹមសំឡេងខ្មែរតាម Timestamp ដើម', nameEn: 'Synchronizing audio' },
+  { id: 'mix_audio', stepNumber: 8, nameKm: 'រក្សាភ្លេង background & SFX ជាមួយ Ducking', nameEn: 'Mixing background audio' },
+  { id: 'render_mp4', stepNumber: 9, nameKm: 'បង្កើតវីដេអូ MP4 H.264 + AAC សម្រេច', nameEn: 'Rendering final MP4' },
+];
+
+async function runAiDubbingPipeline(jobId: string, fromStage?: PipelineStage): Promise<void> {
+  const job = videoJobs.get(jobId);
+  if (!job || !job.inputPath) return;
+  const jobDir = join(JOBS_ROOT, jobId);
+  await mkdir(jobDir, { recursive: true });
+  const ttsDir = join(jobDir, 'tts');
+  await mkdir(ttsDir, { recursive: true });
+
+  const stages: PipelineStage[] = [
+    'extract_audio',
+    'detect_speakers',
+    'detect_speech',
+    'transcribe',
+    'translate_khmer',
+    'generate_voices',
+    'sync_audio',
+    'mix_audio',
+    'render_mp4',
+  ];
+
+  const startIndex = fromStage ? Math.max(0, stages.indexOf(fromStage)) : 0;
+  job.status = 'processing';
+  job.error = undefined;
+  job.failedStage = null;
+
+  try {
+    // -------------------------------------------------------------
+    // STAGE 1: Extract Audio (FFmpeg 16kHz mono)
+    // -------------------------------------------------------------
+    const audioPath = join(jobDir, 'audio_16k.mp3');
+    if (startIndex <= 0 || !job.extractedAudioPath) {
+      job.currentStage = 'extract_audio';
+      job.stepNumber = 1;
+      job.progress = 10;
+      job.message = 'ទាញយកសំឡេងចេញពីវីដេអូដើម (Extracting audio)';
+
+      const probeRes = await execFileAsync('ffprobe', [
+        '-v', 'error', '-show_format', '-show_streams', '-of', 'json', job.inputPath,
+      ], { timeout: 30_000 });
+      const info = JSON.parse(probeRes.stdout || '{}');
+      const streams: any[] = info.streams || [];
+      const vStream = streams.find((s: any) => s.codec_type === 'video');
+      job.hasVideo = Boolean(vStream);
+
+      await execFileAsync('ffmpeg', [
+        '-y', '-i', job.inputPath,
+        '-vn', '-ac', '1', '-ar', '16000',
+        '-c:a', 'libmp3lame', '-q:a', '3',
+        audioPath,
+      ], { timeout: 60_000 });
+
+      job.extractedAudioPath = audioPath;
+      job.progress = 18;
+    }
+
+    // -------------------------------------------------------------
+    // STAGE 4: Transcribe (Speech-to-Text with Whisper)
+    // -------------------------------------------------------------
+    if (startIndex <= 3 || !job.segments || job.segments.length === 0) {
+      job.currentStage = 'transcribe';
+      job.stepNumber = 4;
+      job.progress = 25;
+      job.message = 'បម្លែងសំឡេងនិយាយជាអត្ថបទដើម (Transcribing with Whisper)';
+
+      const audioBuffer = await readFile(job.extractedAudioPath || audioPath);
+      const formData = new FormData();
+      formData.append('file', new Blob([audioBuffer], { type: 'audio/mpeg' }), 'audio_16k.mp3');
+      formData.append('model', 'whisper-large-v3');
+      formData.append('response_format', 'verbose_json');
+      formData.append('temperature', '0');
+      if (job.sourceLanguage && job.sourceLanguage !== 'auto') {
+        formData.append('language', job.sourceLanguage);
+      }
+
+      const apiKeys = getAllGroqKeys({ headers: {} });
+      const { res: whisperRes } = await fetchWithKeyFallback(
+        'https://api.groq.com/openai/v1/audio/transcriptions',
+        apiKeys,
+        { method: 'POST', body: formData }
+      );
+
+      if (!whisperRes.ok) {
+        const errText = await whisperRes.text();
+        throw new Error(`Whisper transcription failed (${whisperRes.status}): ${errText.slice(0, 150)}`);
+      }
+
+      const whisperData = await whisperRes.json() as any;
+      job.detectedLanguage = whisperData.language || 'en';
+      const rawSegments = whisperData.segments || [];
+
+      // Preserve all segments with precise timestamps starting from the very first spoken second
+      job.segments = rawSegments.map((seg: any, idx: number) => ({
+        id: idx + 1,
+        start: Math.max(0, Number(seg.start || 0)),
+        end: Math.max(Number(seg.start || 0) + 0.35, Number(seg.end || (seg.start + 1))),
+        originalText: (seg.text || '').trim(),
+        translatedText: '',
+        isSpeech: true,
+        soundType: 'dialogue' as const,
+        speakerId: 'Speaker 1',
+        speakerGender: 'male' as const,
+        no_speech_prob: seg.no_speech_prob,
+      }));
+      job.progress = 35;
+    }
+
+    // -------------------------------------------------------------
+    // STAGE 3: Detect Speech (VAD)
+    // Filter out music symbols/tags while protecting real dialogue from the start
+    // -------------------------------------------------------------
+    if (startIndex <= 2) {
+      job.currentStage = 'detect_speech';
+      job.stepNumber = 3;
+      job.progress = 42;
+      job.message = 'ត្រួតពិនិត្យ និងច្រោះរកតែសំឡេងនិយាយពិត (VAD / Speech Detection)';
+
+      for (const seg of (job.segments || [])) {
+        const text = (seg.originalText || '').trim();
+        const isPureMusicSymbol = /^[♪\s]+$/.test(text);
+        const isPureBracketedTag = /^[\[\(]\s*(music|applause|laughter|crying|footsteps|gunshot|explosion|instrumental|ambient|cough|screaming|sigh|gasp|cheering)\s*[\]\)]$/i.test(text);
+        const hasLettersOrNumbers = /[a-zA-Z\u00C0-\u024F\u4E00-\u9FFF\u3040-\u30FF\u0E00-\u0E7F0-9]/.test(text);
+
+        if (isPureMusicSymbol || isPureBracketedTag || (!hasLettersOrNumbers && text.length > 0)) {
+          seg.isSpeech = false;
+          seg.soundType = isPureMusicSymbol ? 'music' : 'sfx';
+        } else if ((seg as any).no_speech_prob && (seg as any).no_speech_prob > 0.88 && text.split(/\s+/).length <= 1) {
+          seg.isSpeech = false;
+          seg.soundType = 'noise';
+        } else {
+          seg.isSpeech = true;
+          seg.soundType = 'dialogue';
+        }
+      }
+      job.progress = 48;
+    }
+
+    // -------------------------------------------------------------
+    // STAGE 2: Detect Speakers (Speaker Diarization)
+    // -------------------------------------------------------------
+    if (startIndex <= 1) {
+      job.currentStage = 'detect_speakers';
+      job.stepNumber = 2;
+      job.progress = 52;
+      job.message = 'ស្វែងរក និងកំណត់អត្តសញ្ញាណតួអង្គ (Speaker Diarization)';
+
+      const speechSegs = (job.segments || []).filter(s => s.isSpeech !== false && (s.originalText || '').length > 0);
+      if (speechSegs.length > 0) {
+        try {
+          const apiKeys = getAllGroqKeys({ headers: {} });
+          const diarizationPrompt = `You are an expert film supervisor doing Speaker Diarization and Voice Activity Detection.
+Analyze these dialogue segments and assign consistent speaker identities ('Speaker 1', 'Speaker 2', 'Speaker 3'...) and speakerGender ('male' or 'female').
+If any segment is actually music or sound effect, set isSpeech: false and soundType: 'music' or 'sfx'.
+Input:
+${JSON.stringify(speechSegs.map(s => ({ id: s.id, start: s.start, end: s.end, text: s.originalText })))}
+
+Return a strict JSON array of objects with keys: id, isSpeech, soundType, speakerId, speakerGender. Output JSON array only.`;
+
+          const { res: diarizeRes } = await fetchWithKeyFallback(
+            'https://api.groq.com/openai/v1/chat/completions',
+            apiKeys,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                model: 'openai/gpt-oss-20b',
+                messages: [
+                  { role: 'system', content: 'You are an expert audio analyst. Output JSON array only.' },
+                  { role: 'user', content: diarizationPrompt }
+                ],
+                temperature: 0.1,
+                max_tokens: 1500,
+              })
+            }
+          );
+
+          if (diarizeRes.ok) {
+            const dData = await diarizeRes.json() as any;
+            const content = dData.choices?.[0]?.message?.content || '';
+            const m = content.match(/\[[\s\S]*\]/);
+            if (m) {
+              const parsed = JSON.parse(m[0]);
+              if (Array.isArray(parsed)) {
+                for (const item of parsed) {
+                  const seg = job.segments?.find(s => s.id === item.id);
+                  if (seg) {
+                    if (item.isSpeech === false) {
+                      seg.isSpeech = false;
+                      seg.soundType = item.soundType || 'sfx';
+                    } else {
+                      seg.isSpeech = true;
+                      seg.soundType = 'dialogue';
+                      seg.speakerId = item.speakerId || 'Speaker 1';
+                      seg.speakerGender = item.speakerGender === 'female' ? 'female' : 'male';
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } catch (e: any) {
+          console.warn('[Pipeline] Diarization warning:', e?.message);
+        }
+      }
+      job.progress = 56;
+    }
+
+    // -------------------------------------------------------------
+    // STAGE 5: Translate to Khmer (Natural Spoken Khmer)
+    // -------------------------------------------------------------
+    if (startIndex <= 4) {
+      job.currentStage = 'translate_khmer';
+      job.stepNumber = 5;
+      job.progress = 60;
+      job.message = 'បកប្រែជាភាសាខ្មែរធម្មជាតិ រលូន (Natural Khmer Translation)';
+
+      const dialogueSegs = (job.segments || []).filter(s => s.isSpeech !== false && (s.originalText || '').length > 0);
+      if (dialogueSegs.length > 0) {
+        const apiKeys = getAllGroqKeys({ headers: {} });
+        const translatePrompt = `You are a master film dubbing director for Cambodian Khmer cinema.
+Translate the following spoken dialogue segments into natural, conversational, fluent spoken Khmer (ភាសានិយាយខ្មែរធម្មជាតិ រលូន សមរម្យ ដូចមនុស្សនិយាយពិតៗ មិនបកប្រែពាក្យមួយៗ word-by-word បែបម៉ាស៊ីន).
+Dialogue segments:
+${JSON.stringify(dialogueSegs.map(s => ({ id: s.id, speaker: s.speakerId, text: s.originalText })))}
+
+Return a strict JSON array of objects with keys: id, translatedText.
+Output JSON array only.`;
+
+        const { res: transRes } = await fetchWithKeyFallback(
+          'https://api.groq.com/openai/v1/chat/completions',
+          apiKeys,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: 'openai/gpt-oss-20b',
+              messages: [
+                { role: 'system', content: 'You are an expert Khmer film dubbing translator. Output JSON array only.' },
+                { role: 'user', content: translatePrompt }
+              ],
+              temperature: 0.2,
+              max_tokens: 2000,
+            })
+          }
+        );
+
+        if (transRes.ok) {
+          const tData = await transRes.json() as any;
+          const content = tData.choices?.[0]?.message?.content || '';
+          const m = content.match(/\[[\s\S]*\]/);
+          if (m) {
+            try {
+              const parsed = JSON.parse(m[0]);
+              if (Array.isArray(parsed)) {
+                for (const item of parsed) {
+                  const seg = job.segments?.find(s => s.id === item.id);
+                  if (seg && item.translatedText) {
+                    seg.translatedText = item.translatedText.trim();
+                  }
+                }
+              }
+            } catch (err) {
+              console.warn('[Pipeline] Parse translation json failed:', err);
+            }
+          }
+        }
+
+        for (const seg of dialogueSegs) {
+          if (!seg.translatedText || !/[\u1780-\u17FF]/.test(seg.translatedText)) {
+            seg.translatedText = seg.originalText || '';
+          }
+        }
+      }
+      job.progress = 68;
+    }
+
+    // -------------------------------------------------------------
+    // STAGE 6: Generate Khmer Voices (Consistent per speaker)
+    // -------------------------------------------------------------
+    if (startIndex <= 5) {
+      job.currentStage = 'generate_voices';
+      job.stepNumber = 6;
+      job.progress = 72;
+      job.message = 'បង្កើតសំឡេងខ្មែរតាមតួអង្គ និង segment (Consistent Voices)';
+
+      const dubSegs = (job.segments || []).filter(s => s.isSpeech !== false && (s.translatedText || '').trim().length > 0);
+      for (let i = 0; i < dubSegs.length; i++) {
+        const seg = dubSegs[i];
+        const segFile = join(ttsDir, `seg_${seg.id}.mp3`);
+
+        let voice = 'km-KH-PisethNeural';
+        let options: { rate?: string; pitch?: string } = { rate: '+0%', pitch: '+0Hz' };
+        if (seg.speakerGender === 'female' || seg.speakerId === 'Speaker 2') {
+          voice = 'km-KH-SreymomNeural';
+        } else if (seg.speakerId === 'Speaker 3') {
+          voice = 'km-KH-PisethNeural';
+          options = { rate: '-4%', pitch: '-2Hz' };
+        } else if (seg.speakerId === 'Speaker 4') {
+          voice = 'km-KH-SreymomNeural';
+          options = { rate: '+4%', pitch: '+2Hz' };
+        }
+
+        seg.voiceId = voice;
+        let audioBuf: Buffer | null = await edgeTTS(seg.translatedText || '', voice, options);
+        if (!audioBuf || audioBuf.length < 500) {
+          try {
+            audioBuf = await fetchGoogleTTSChunk(seg.translatedText || '', 'km');
+          } catch {
+            audioBuf = null;
+          }
+        }
+
+        if (audioBuf && audioBuf.length > 500) {
+          await writeFile(segFile, audioBuf);
+          seg.dubbedAudioBase64 = audioBuf.toString('base64');
+          const dur = await probeDuration(['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', segFile]);
+          seg.audioDuration = dur > 0.05 ? dur : (seg.end - seg.start);
+        }
+
+        job.progress = 72 + Math.round(8 * ((i + 1) / Math.max(1, dubSegs.length)));
+      }
+    }
+
+    // -------------------------------------------------------------
+    // STAGE 7: Synchronizing Audio (100% Precision Sync & Time-Stretch)
+    // -------------------------------------------------------------
+    const clipsToMix: { segId: number; start: number; end: number; path: string; duration: number }[] = [];
+    if (startIndex <= 6) {
+      job.currentStage = 'sync_audio';
+      job.stepNumber = 7;
+      job.progress = 81;
+      job.message = 'តម្រឹមសំឡេងខ្មែរ 100% ស៊ីគ្នានឹងវីដេអូ (100% Synchronizing)';
+
+      const dubSegs = (job.segments || []).filter(s => s.isSpeech !== false && (s.dubbedAudioBase64 || '').length > 100);
+      for (const seg of dubSegs) {
+        const segFile = join(ttsDir, `seg_${seg.id}.mp3`);
+        const syncedFile = join(ttsDir, `synced_${seg.id}.wav`);
+        const origWindow = Math.max(0.35, seg.end - seg.start);
+        const ttsDur = seg.audioDuration || origWindow;
+
+        // Calculate exact speed ratio needed to fit origWindow 100%
+        const speedRatio = ttsDur / origWindow;
+        const clampedRatio = Math.min(Math.max(speedRatio, 0.4), 3.5);
+        const atempoFilters: string[] = [];
+        let r = clampedRatio;
+        let guard = 0;
+        while (r > 2.0 && guard < 6) { atempoFilters.push('atempo=2.0'); r /= 2; guard++; }
+        while (r < 0.5 && guard < 6) { atempoFilters.push('atempo=0.5'); r /= 0.5; guard++; }
+        if (Math.abs(r - 1.0) >= 0.015) {
+          atempoFilters.push(`atempo=${r.toFixed(4)}`);
+        }
+        const atempoChain = atempoFilters.length > 0 ? `${atempoFilters.join(',')},` : '';
+
+        try {
+          const fadeOutStart = Math.max(0, origWindow - 0.04);
+          await execFileAsync('ffmpeg', [
+            '-y', '-i', segFile,
+            '-filter:a', `${atempoChain}aformat=channel_layouts=stereo,aresample=48000:async=1:min_hard_comp=0.100000,apad,atrim=start=0:duration=${origWindow.toFixed(3)},afade=t=in:st=0:d=0.02,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.04`,
+            syncedFile
+          ], { timeout: 20_000 });
+          clipsToMix.push({ segId: seg.id, start: seg.start, end: seg.end, path: syncedFile, duration: origWindow });
+        } catch (e: any) {
+          console.warn('[Sync] Time stretch error, using fallback:', e?.message);
+          clipsToMix.push({ segId: seg.id, start: seg.start, end: seg.end, path: segFile, duration: ttsDur });
+        }
+      }
+      job.progress = 85;
+    }
+
+    // -------------------------------------------------------------
+    // STAGE 8: Mixing Background Audio (Original Voice Silenced 100% During Speech)
+    // -------------------------------------------------------------
+    const mixedAudioPath = join(jobDir, 'mixed_audio.m4a');
+    if (startIndex <= 7) {
+      job.currentStage = 'mix_audio';
+      job.stepNumber = 8;
+      job.progress = 87;
+      job.message = 'បំបាត់សំឡេងតួដើម 100% ពេលនិយាយ និងរក្សាភ្លេង background & SFX';
+
+      const aProbe = await execFileAsync('ffprobe', [
+        '-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=channels,codec_name', '-of', 'json', job.inputPath
+      ], { timeout: 15_000 });
+      const aInfo = JSON.parse(aProbe.stdout || '{}');
+      const hasOriginalAudio = Boolean(aInfo.streams?.[0]);
+
+      if (clipsToMix.length === 0) {
+        if (hasOriginalAudio) {
+          await execFileAsync('ffmpeg', ['-y', '-i', job.inputPath, '-vn', '-c:a', 'aac', '-b:a', '192k', mixedAudioPath], { timeout: 60_000 });
+        } else {
+          await execFileAsync('ffmpeg', ['-y', '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-t', '10', '-c:a', 'aac', mixedAudioPath], { timeout: 15_000 });
+        }
+      } else {
+        const ffmpegArgs: string[] = ['-y', '-i', job.inputPath];
+        for (const clip of clipsToMix) {
+          ffmpegArgs.push('-i', clip.path);
+        }
+
+        const filterComplex: string[] = [];
+
+        // 1. Duck original background audio:
+        // When AI Khmer voice speaks: volume is exactly 0.0 (100% silent, completely muting original voice)
+        // Between speech lines (intro music, sound effects, ambience): volume is 1.0 (100% full background audio)
+        // Smooth 60ms crossfade ramps prevent clicks and pops
+        if (hasOriginalAudio) {
+          const pre = 0.06;
+          const post = 0.08;
+          const fade = 0.06;
+          const terms = clipsToMix.map((c) => {
+            const s = Math.max(0, c.start - pre);
+            const e = Math.max(c.start + c.duration + post, s + 0.35);
+            return `min(1,max(0,min((t-${s.toFixed(3)})/${fade.toFixed(3)},(${e.toFixed(3)}-t)/${fade.toFixed(3)})))`;
+          });
+          // 1 - 1.0 * min(1, sum): strictly 0.0 during speech!
+          const duckExpr = `1-1.0*min(1,${terms.join('+')})`;
+          filterComplex.push(`[0:a]aformat=channel_layouts=stereo,aresample=48000,volume='${duckExpr}':eval=frame[bg]`);
+        }
+
+        // 2. Align voice clips onto the timeline with sample-accurate adelay
+        for (let i = 0; i < clipsToMix.length; i++) {
+          const c = clipsToMix[i];
+          const delayMs = Math.max(0, Math.round(c.start * 1000));
+          const inputIdx = i + 1;
+          filterComplex.push(
+            `[${inputIdx}:a]aformat=channel_layouts=stereo,aresample=48000,adelay=${delayMs}|${delayMs}[v${i}]`
+          );
+        }
+
+        // 3. Merge into speech bus [vc] with normalize=0 so volume is loud and crisp
+        const voiceInputs = clipsToMix.map((_, i) => `[v${i}]`);
+        if (voiceInputs.length === 1) {
+          filterComplex.push(`${voiceInputs[0]}anull[vc]`);
+        } else {
+          filterComplex.push(`${voiceInputs.join('')}amix=inputs=${voiceInputs.length}:duration=longest:dropout_transition=0:normalize=0,aresample=48000[vc]`);
+        }
+
+        // 4. Mix ducked background [bg] + voice bus [vc] with alimiter to prevent distortion
+        if (hasOriginalAudio) {
+          filterComplex.push('[bg][vc]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,aresample=48000,alimiter=limit=0.98:level=false[aout]');
+          ffmpegArgs.push('-filter_complex', filterComplex.join(';'), '-map', '[aout]');
+        } else {
+          filterComplex.push('[vc]alimiter=limit=0.98:level=false[aout]');
+          ffmpegArgs.push('-filter_complex', filterComplex.join(';'), '-map', '[aout]');
+        }
+
+        ffmpegArgs.push('-c:a', 'aac', '-b:a', '192k', mixedAudioPath);
+        await execFileAsync('ffmpeg', ffmpegArgs, { timeout: 120_000 });
+      }
+
+      job.progress = 92;
+    }
+
+    // -------------------------------------------------------------
+    // STAGE 9: Rendering Final MP4
+    // -------------------------------------------------------------
+    job.currentStage = 'render_mp4';
+    job.stepNumber = 9;
+    job.progress = 94;
+    job.message = 'បង្កើតវីដេអូ MP4 H.264 + AAC គុណភាពដើមសម្រេច';
+
+    const finalMp4Path = join(jobDir, 'final_translated.mp4');
+    const now = new Date();
+    const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}`;
+    const filename = `translated-khmer-${stamp}.mp4`;
+
+    let muxSuccess = false;
+    if (job.hasVideo) {
+      try {
+        await execFileAsync('ffmpeg', [
+          '-y',
+          '-i', job.inputPath,
+          '-i', mixedAudioPath,
+          '-c:v', 'copy',
+          '-c:a', 'copy',
+          '-map', '0:v:0',
+          '-map', '1:a:0',
+          '-movflags', '+faststart',
+          finalMp4Path,
+        ], { timeout: 60_000 });
+        muxSuccess = true;
+      } catch {
+        muxSuccess = false;
+      }
+    }
+
+    if (!muxSuccess) {
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-i', job.inputPath,
+        '-i', mixedAudioPath,
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '22',
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-map', '0:v:0?',
+        '-map', '1:a:0',
+        '-movflags', '+faststart',
+        finalMp4Path,
+      ], { timeout: 120_000 });
+    }
+
+    const outProbe = await execFileAsync('ffprobe', [
+      '-v', 'error', '-show_entries', 'stream=codec_name,codec_type', '-of', 'json', finalMp4Path
+    ], { timeout: 15_000 });
+    const outInfo = JSON.parse(outProbe.stdout || '{}');
+    if (!outInfo.streams || outInfo.streams.length === 0) {
+      throw new Error('FFmpeg generated invalid MP4 with no streams');
+    }
+
+    const outStat = await stat(finalMp4Path);
+    if (outStat.size < 1000) {
+      throw new Error('Generated MP4 file is too small');
+    }
+
+    job.status = 'done';
+    job.currentStage = null;
+    job.progress = 100;
+    job.message = 'វីដេអូរួចរាល់ (Ready)';
+    job.outputPath = finalMp4Path;
+    job.downloadFilename = filename;
+    job.size = outStat.size;
+
+  } catch (err: any) {
+    console.error(`[Pipeline Error] Job ${jobId} failed at stage ${job.currentStage}:`, err);
+    job.status = 'error';
+    job.failedStage = job.currentStage || 'extract_audio';
+    job.error = err?.message || `ការដំណើរការបានបរាជ័យនៅដំណាក់កាល ${job.currentStage}`;
+  }
+}
+
+// Start 9-stage pipeline endpoint
+app.post('/api/pipeline/start', (req: any, res: any, next: any) => {
+  (videoUpload.any() as any)(req, res, (err: any) => {
+    if (err) {
+      console.error('[Pipeline Start] Multer upload error:', err);
+      return res.status(400).json({ error: err?.message || 'File upload failed' });
+    }
+    next();
+  });
+}, async (req: any, res: any) => {
+  const uploadedFile = (req.files && req.files.length > 0) ? req.files[0] : req.file;
+  let jobId = req.body?.jobId as string | undefined;
+  let job: VideoJob | undefined;
+
+  if (uploadedFile) {
+    jobId = randomUUID();
+    ensureJobDirs();
+    const jobDir = join(JOBS_ROOT, jobId);
+    await mkdir(jobDir, { recursive: true });
+    const ext = safeExt(uploadedFile.mimetype, uploadedFile.originalname);
+    const diskPath = join(jobDir, `original.${ext}`);
+    await rename(uploadedFile.path, diskPath);
+
+    job = {
+      id: jobId,
+      status: 'queued',
+      progress: 5,
+      message: 'កំពុងរៀបចំវីដេអូ (Preparing video)',
+      createdAt: Date.now(),
+      inputPath: diskPath,
+      originalName: uploadedFile.originalname,
+      sourceLanguage: req.body?.sourceLanguage || 'auto',
+      targetLanguage: req.body?.targetLanguage || 'km',
+      currentStage: 'extract_audio',
+      stepNumber: 1,
+    };
+    videoJobs.set(jobId, job);
+  } else if (jobId) {
+    job = videoJobs.get(jobId);
+    if (!job) {
+      res.status(404).json({ error: 'Job not found' });
+      return;
+    }
+    if (req.body?.sourceLanguage) job.sourceLanguage = req.body.sourceLanguage;
+    if (req.body?.targetLanguage) job.targetLanguage = req.body.targetLanguage;
+  } else {
+    res.status(400).json({ error: 'No video file or jobId provided' });
+    return;
+  }
+
+  res.json({
+    jobId,
+    status: 'processing',
+    currentStage: 'extract_audio',
+    stepNumber: 1,
+    message: 'ចាប់ផ្តើមដំណើរការបកប្រែវីដេអូ AI (Starting AI Dubbing Pipeline)',
+  });
+
+  void runAiDubbingPipeline(jobId);
+});
+
+// Granular status endpoint for the 9-stage pipeline
+app.get('/api/pipeline/status/:id', (req, res) => {
+  const job = videoJobs.get(req.params.id);
+  if (!job) {
+    res.status(404).json({ error: 'Job not found' });
+    return;
+  }
+
+  res.json({
+    jobId: job.id,
+    status: job.status,
+    currentStage: job.currentStage,
+    stepNumber: job.stepNumber || 1,
+    progress: job.progress,
+    message: job.message,
+    error: job.error,
+    failedStage: job.failedStage,
+    hasVideo: job.hasVideo,
+    segments: job.segments || [],
+    detectedLanguage: job.detectedLanguage,
+    downloadUrl: job.status === 'done' ? `/api/video/download/${job.id}` : undefined,
+    streamUrl: job.status === 'done' ? `/api/video/stream/${job.id}` : undefined,
+    downloadFilename: job.downloadFilename,
+    size: job.size,
+  });
+});
+
+// Retry endpoint for retrying from any failed or specific stage without re-uploading
+app.post('/api/pipeline/retry', express.json(), async (req, res) => {
+  const { jobId, stage } = req.body || {};
+  const job = videoJobs.get(jobId);
+  if (!job || !job.inputPath) {
+    res.status(404).json({ error: 'Job not found or original file missing' });
+    return;
+  }
+
+  const retryStage: PipelineStage = stage || job.failedStage || job.currentStage || 'extract_audio';
+  const stageCfg = PIPELINE_CONFIG.find(s => s.id === retryStage);
+
+  job.status = 'processing';
+  job.currentStage = retryStage;
+  job.stepNumber = stageCfg?.stepNumber || 1;
+  job.failedStage = null;
+  job.error = undefined;
+  job.message = `សាកល្បងដំណាក់កាល ${stageCfg?.stepNumber} ឡើងវិញ (Retrying stage ${retryStage})`;
+
+  res.json({
+    jobId,
+    status: 'processing',
+    stage: retryStage,
+    stepNumber: stageCfg?.stepNumber || 1,
+  });
+
+  void runAiDubbingPipeline(jobId, retryStage);
 });
 
 // ---------------------------------------------------------------- Shotstack
@@ -1773,15 +2508,22 @@ function buildVtt(segments: any[], useTranslation: boolean): string {
   return lines.join("\n");
 }
 
-// --- Vite Dev Middleware ---
+// --- Vite Dev Middleware & Production Static Serving ---
 
 async function startServer() {
-  const vite = await createViteServer({
-    server: { middlewareMode: true },
-    appType: "spa",
-  });
-
-  app.use(vite.middlewares);
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (_req, res) => {
+      res.sendFile(join(distPath, "index.html"));
+    });
+  }
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running at http://0.0.0.0:${PORT}`);

@@ -21,9 +21,10 @@ import { OptionsBar } from './components/OptionsBar';
 import { MediaPlayer, MediaPlayerHandle } from './components/MediaPlayer';
 import { TranscriptView } from './components/TranscriptView';
 import { ExportToolbar } from './components/ExportToolbar';
+import { ProcessingDashboard, PipelineStatusData } from './components/ProcessingDashboard';
 import { WorkflowSteps, WorkflowStepId } from './components/WorkflowSteps';
 import { UILang, UI_TEXT } from './data/translations';
-import { SubtitleSegment, TranscriptionResult, ServerStatus } from './types';
+import { SubtitleSegment, TranscriptionResult, ServerStatus, PipelineStage } from './types';
 import { LANGUAGES, SampleMedia } from './data/languages';
 import { exportToSrt, exportToVtt } from './utils/subtitleUtils';
 import { apiUrl } from './utils/api';
@@ -172,6 +173,137 @@ export default function App() {
     setTimeout(() => {
       document.body.removeChild(a);
     }, 200);
+  };
+
+  // 9-Stage AI Video Dubbing Pipeline State
+  const [pipelineData, setPipelineData] = useState<PipelineStatusData | null>(null);
+  const pipelinePollRef = useRef<number | null>(null);
+
+  // Clean up polling interval on unmount
+  useEffect(() => {
+    return () => {
+      if (pipelinePollRef.current) clearInterval(pipelinePollRef.current);
+    };
+  }, []);
+
+  const startPipelinePolling = (jobId: string) => {
+    if (pipelinePollRef.current) {
+      clearInterval(pipelinePollRef.current);
+    }
+
+    pipelinePollRef.current = window.setInterval(async () => {
+      try {
+        const res = await fetch(`/api/pipeline/status/${jobId}`);
+        if (!res.ok) return;
+        const statusData: PipelineStatusData = await res.json();
+        setPipelineData(statusData);
+
+        if (statusData.message) {
+          setProcessingStep(statusData.message);
+        }
+
+        if (statusData.status === 'done') {
+          if (pipelinePollRef.current) {
+            clearInterval(pipelinePollRef.current);
+            pipelinePollRef.current = null;
+          }
+          setIsProcessing(false);
+          setProcessingStep(null);
+
+          const segs: SubtitleSegment[] = (statusData.segments || []).map((s: any, idx: number) => ({
+            id: s.id ?? idx + 1,
+            start: s.start,
+            end: s.end,
+            originalText: s.originalText || '',
+            translatedText: s.translatedText || '',
+            isSpeech: s.isSpeech,
+            soundType: s.soundType,
+            speakerId: s.speakerId,
+            speakerGender: s.speakerGender,
+            voiceId: s.voiceId,
+            dubbedAudioBase64: s.dubbedAudioBase64 || '',
+            audioDuration: s.audioDuration,
+          }));
+
+          setResult({
+            detectedLanguage: statusData.detectedLanguage || 'auto',
+            targetLanguage: 'km',
+            targetLanguageName: 'ភាសាខ្មែរ (Khmer)',
+            duration: segs.length > 0 ? segs[segs.length - 1].end : 0,
+            processingTimeMs: 0,
+            fullOriginalText: segs.map((s) => s.originalText).join(' '),
+            fullTranslatedText: segs.map((s) => s.translatedText).join(' '),
+            segments: segs,
+            srtOriginal: '',
+            srtTranslated: '',
+            vttOriginal: '',
+            vttTranslated: '',
+          });
+
+          // Stream the rendered MP4 with synchronized dubbed voice directly
+          if (statusData.streamUrl) {
+            setMediaPreviewUrl(statusData.streamUrl);
+            setMediaType('video');
+          }
+
+          // Enable direct download of the final MP4
+          if (statusData.downloadUrl) {
+            setExportedResult({
+              url: statusData.downloadUrl,
+              filename: statusData.downloadFilename || 'khmer-dubbed-video.mp4',
+              size: statusData.size || 0,
+              ext: 'mp4',
+              isServerMp4: true,
+            });
+          }
+
+          setMaxReached(3);
+        } else if (statusData.status === 'error') {
+          if (pipelinePollRef.current) {
+            clearInterval(pipelinePollRef.current);
+            pipelinePollRef.current = null;
+          }
+          setIsProcessing(false);
+          setProcessingStep(null);
+          setErrorMessage(statusData.error || 'AI Video Dubbing Pipeline encountered an error.');
+        }
+      } catch (pollErr) {
+        console.error('Error polling pipeline status:', pollErr);
+      }
+    }, 1000);
+  };
+
+  const handleRetryStep = async (stage?: PipelineStage) => {
+    if (!pipelineData?.jobId) return;
+    try {
+      setIsProcessing(true);
+      setErrorMessage(null);
+      const res = await fetch('/api/pipeline/retry', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId: pipelineData.jobId, stage }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || 'Failed to retry stage');
+      }
+      startPipelinePolling(pipelineData.jobId);
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Retry failed');
+      setIsProcessing(false);
+    }
+  };
+
+  const handleResetPipeline = () => {
+    if (pipelinePollRef.current) {
+      clearInterval(pipelinePollRef.current);
+      pipelinePollRef.current = null;
+    }
+    setPipelineData(null);
+    setIsProcessing(false);
+    setErrorMessage(null);
+    resetWorkspaceState();
+    goToStep(1);
   };
 
   // Fetch server status on mount
@@ -357,6 +489,53 @@ export default function App() {
     setProcessingStep(t.processingStep1);
 
     try {
+      // 9-Stage AI Video Dubbing Pipeline (MP4 Video)
+      const isMp4Video =
+        mediaType === 'video' ||
+        (selectedFile && (selectedFile.name.toLowerCase().endsWith('.mp4') || selectedFile.type === 'video/mp4'));
+
+      if (isMp4Video && (selectedFile || mediaPreviewUrl)) {
+        setProcessingStep(
+          uiLang === 'km'
+            ? 'កំពុងបញ្ចូលវីដេអូ និងចាប់ផ្ដើមដំណាក់កាលបកប្រែទាំង 9...'
+            : 'Uploading MP4 video and starting 9-stage AI pipeline...'
+        );
+        goToStep(2);
+
+        let videoFile: File | Blob | null = selectedFile;
+        if (!videoFile && mediaPreviewUrl) {
+          const resp = await fetch(mediaPreviewUrl);
+          const blob = await resp.blob();
+          videoFile = new File([blob], 'sample-video.mp4', { type: 'video/mp4' });
+        }
+
+        if (!videoFile) {
+          throw new Error('Please upload an MP4 video first.');
+        }
+
+        const formData = new FormData();
+        formData.append('file', videoFile);
+        formData.append('sourceLanguage', sourceLang);
+        formData.append('targetLanguage', targetLang);
+        if (groqKey.trim()) {
+          formData.append('groqApiKey', groqKey.trim());
+        }
+
+        const startRes = await fetch('/api/pipeline/start', {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!startRes.ok) {
+          const startErr = await startRes.json().catch(() => ({}));
+          throw new Error(startErr.error || 'Failed to start AI Dubbing Pipeline');
+        }
+
+        const startData = await startRes.json();
+        startPipelinePolling(startData.jobId);
+        return;
+      }
+
       let fileToUpload: File | Blob | null = selectedFile;
 
       // If user selected sample media without an uploaded local File
@@ -901,8 +1080,20 @@ export default function App() {
               userId={user?.sub}
             />
 
-            {/* Processing Indicator */}
-            {isProcessing && (
+            {/* 9-Stage AI Video Dubbing Pipeline Dashboard */}
+            {(pipelineData || (isProcessing && mediaType === 'video')) && (
+              <ProcessingDashboard
+                uiLang={uiLang}
+                pipelineData={pipelineData}
+                isProcessing={isProcessing}
+                onRetryStep={handleRetryStep}
+                onReset={handleResetPipeline}
+                onOpenPlayer={() => goToStep(3)}
+              />
+            )}
+
+            {/* Fallback Processing Indicator */}
+            {isProcessing && !pipelineData && mediaType !== 'video' && (
               <div className="p-6 rounded-2xl bg-white border border-stone-200 text-center shadow-xs space-y-3">
                 <div className="w-10 h-10 mx-auto rounded-full bg-orange-100 text-orange-600 flex items-center justify-center animate-spin">
                   <Sparkles className="w-5 h-5" />

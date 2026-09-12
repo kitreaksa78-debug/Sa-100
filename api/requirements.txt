@@ -1,4 +1,0 @@
-flask>=3.0,<4
-requests>=2.31,<3
-edge-tts>=7.0,<8
-imageio-ffmpeg>=0.4.9
